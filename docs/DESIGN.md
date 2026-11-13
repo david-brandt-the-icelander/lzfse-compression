@@ -1,6 +1,6 @@
 # lzfse-compression: design
 
-Status: **draft for review**. Nothing here is implemented yet.
+Status: **approved** (owner decisions in section 9). Implementation follows the milestones in section 8.
 
 ## 1. Goals
 
@@ -17,7 +17,11 @@ Status: **draft for review**. Nothing here is implemented yet.
 5. **Usable by `free-disk-space`.** It must cover APFS transparent compression (decmpfs types 11/12), which macOS 26–27 no longer writes through `ditto --hfsCompression`.
 6. **A portfolio piece.** That means a readable design, measured claims and reproducible benchmarks.
 
-Non-goals for now: Intel-specific tuning (Intel Macs get the portable path), GPU, Neural Engine or AMX/SME offload (section 5.5), and other Apple formats (LZ4, LZBITMAP, Brotli).
+Non-goals for now:
+
+- Intel Macs: not supported. The portable Rust path still builds on x86-64 Linux for CI.
+- GPU, Neural Engine and AMX/SME offload (section 5.5).
+- Other Apple formats (LZ4, LZBITMAP, Brotli).
 
 ## 2. Clean-room policy
 
@@ -31,38 +35,101 @@ These are the facts we need, plus how we will confirm each one. Items marked **v
 
 ### 3.1 Stream structure
 
+Confirmed from the reference source. Interoperability is tested against Apple's codec in CI (section 7).
+
 An LZFSE stream is a sequence of blocks. Each block starts with a 4-byte little-endian magic:
 
 | Magic | Block | Contents |
 |---|---|---|
 | `bvx-` | Uncompressed | `u32` raw size, then raw bytes |
-| `bvxn` | LZVN | `u32` raw size, `u32` payload size, LZVN payload |
-| `bvx1` | LZFSE v1 | Header with full-width fields, then payload |
-| `bvx2` | LZFSE v2 | Bit-packed header with compressed frequency tables, then payload |
+| `bvxn` | LZVN | `u32` raw size, `u32` payload size, then an LZVN payload that ends with its own end-of-stream opcode |
+| `bvx1` | LZFSE v1 | 772-byte header with full-width fields (770 bytes of fields plus 2 bytes of C struct padding), then the payload |
+| `bvx2` | LZFSE v2 | Bit-packed header with compressed frequency tables, then the payload |
 | `bvx$` | End of stream | none |
 
 - **Decoder:** must accept all five block types.
-- **Encoder:** emits `bvx2` for normal input, `bvxn` for small input (the reference switches below about 4 KiB, **verify**), `bvx-` when compression does not help, and always `bvx$` at the end.
+- **Encoder:** Apple's emits `bvx-` below 8 bytes and `bvxn` below 4,096 bytes, falls back to `bvx-` when compression does not help, uses `bvx2` otherwise, and always ends with `bvx$`. We follow the same policy.
+- **Cross-block matches:** a match may refer to output from earlier blocks, up to the maximum distance. Each block starts with no previous distance.
 
 ### 3.2 LZFSE block (`bvx1` / `bvx2`)
 
-- **Two token streams:** a block holds a literal stream and a stream of L/M/D tokens (literal length, match length, match distance). The block limit is about 10,000 matches (**verify**).
-- **Literals** are entropy-coded with FSE (finite-state entropy, a table-driven form of asymmetric numeral systems). The codec uses 4 interleaved states over a 256-symbol alphabet with a 1,024-state table (**verify**).
-- **L, M and D** are each coded as an FSE symbol plus extra raw bits. The symbol and state counts per table are believed to be L 20/64, M 20/64 and D 64/256 (**verify**), with base-value and extra-bit tables per symbol.
-- **Bit order:** bitstreams are written so the decoder reads them backwards from the end (**verify** bit order and how the final word is padded).
-- **Headers:**
-  - `bvx1` stores counts, sizes, initial FSE states and the frequency tables as plain integers.
-  - `bvx2` packs the same fields into three 64-bit words plus variable-length-coded frequency tables.
-  - We decode both, and encode `bvx2` only.
-- **Limits:** the maximum L, M and D values and the window size are header-level constants. Each is **verify**, with a test that exercises it.
+**Token streams**
+- **L/M/D tokens:** a block holds up to 10,000 tokens. Each token is a literal length L, a match length M and a match distance D.
+- **Literals:** up to 40,000 literal bytes per block, counted after padding to a multiple of 4 with zero bytes.
+- **Limits:**
+  - L ≤ 315 and M ≤ 2,359 per token. Longer runs are split. A literal-only token has M = 0 and D = 1 (D is unused in that case).
+  - D ≤ 262,139.
+  - D = 0 means "repeat the previous distance". The previous distance resets at every block.
+
+**Symbols**
+- **Literals:** one 256-symbol FSE alphabet with 1,024 states, coded with 4 interleaved states. Literal *i* uses state *i* mod 4.
+- **L, M and D:** each value is coded as an FSE symbol plus raw extra bits, with a fixed base and extra-bit count per symbol. The alphabets are L 20 symbols / 64 states, M 20 / 64 and D 64 / 256.
+
+**FSE (tANS) tables**
+- **State ranges:** each used symbol owns a contiguous range of `f` decoder states, where `f` is its normalised frequency. Symbols are laid out in ascending order, with no state spreading.
+- **Bit counts:** for a symbol with frequency `f` and `N` total states, `k` is chosen so that `N ≤ f·2^k < 2N`. The first `j0 = 2N/2^k − f` states of the range read `k` bits; the rest read `k−1` bits.
+- **Next state:** the next state is a per-state base plus the bits read.
+
+**Bitstreams**
+- **Writing:** the encoder pushes bits least-significant first into a 64-bit accumulator and flushes whole bytes forward. It encodes the last symbol first.
+- **Reading:** the decoder reads the stream backwards from its end, taking the most recently pushed bits first.
+- **Padding:** the final partial byte is zero-padded. The header stores how much (`bits` in [−7, 0], stored +7 in v2).
+- **Token payload:** starts with 8 zero bytes, so Apple's decoder can read 8 bytes at a time without running off the start.
+- **Literal payload:** has no such padding. Apple's decoder may read into the header bytes before it, but never uses those bits.
+
+**Initial states**
+The encoder starts every state at 0. The final encoder states are stored in the header and become the decoder's initial states.
+
+**Order within a token**
+For each token, from last to first, the encoder pushes D extra bits, D state bits, M extra bits, M state bits, L extra bits and L state bits. The decoder therefore reads L, then M, then D.
+
+**Headers**
+- **`bvx1`:** stores the counts, payload sizes, final states and four frequency tables as plain little-endian integers.
+- **`bvx2`:**
+  - **Packed fields:** three packed 64-bit words follow the magic and the raw size:
+    - word 0: literal count (20 bits), literal payload bytes (20), match count (20), `literal_bits + 7` (3);
+    - word 1: the 4 literal states (10 bits each), token payload bytes (20), `lmd_bits + 7` (3);
+    - word 2: total header size (32), then the L, M and D states (10 bits each).
+  - **Frequency tables:** follow as a variable-length bit string, least-significant bit first, in the order L (20), M (20), D (64), literals (256). Codes, written low bits first:
+    - `0` → `00`, `1` → `10` (2 bits);
+    - `2` → `001`, `3` → `101` (3 bits);
+    - 4–7 → 5 bits ending in `011`;
+    - 8–23 → 8 bits: `0111` then the value − 8 in 4 bits;
+    - 24–1047 → 14 bits: `1111` then the value − 24 in 10 bits.
 
 ### 3.3 LZVN
 
-- **What it is:** a byte-oriented LZ77 format with no entropy coding. Opcodes encode literal length, match length and distance in a few forms (small, medium and large distance; repeat previous distance; long literal; long match). An end-of-stream opcode `0x06` is followed by 7 zero bytes, and there are no-op opcodes.
-- **Where it appears:**
-  - inside LZFSE streams as `bvxn` blocks;
-  - standalone in decmpfs types 7/8.
-- **Verified:** we have already confirmed the opcode set by hand-decoding output from `libcompression` algorithm `0x900`.
+LZVN is a byte-oriented LZ77 format with no entropy coding. Each opcode carries up to 3 literal bytes (L), a match length (M) and a distance (D).
+
+**Opcode forms**
+
+| Form | Bytes | Fields |
+|---|---|---|
+| Small distance `sml_d` | `LLMMMDDD DDDDDDDD` | L 0–3, M 3–10, D < 1,536 (the 3 high bits must be 0–5) |
+| Medium distance `med_d` | `101LLMMM DDDDDDMM DDDDDDDD` | L 0–3, M 3–34, D < 16,384 |
+| Large distance `lrg_d` | `LLMMM111` + 16-bit D | L 0–3, M 3–10, D < 65,536 |
+| Previous distance `pre_d` | `LLMMM110` | L 1–3, M 3–10, D = previous distance |
+| Small match `sml_m` | `1111MMMM` | M 1–15, previous distance |
+| Large match `lrg_m` | `11110000` + byte | M 16–271, previous distance |
+| Small literal `sml_l` | `1110LLLL` | L 1–15 |
+| Large literal `lrg_l` | `11100000` + byte | L 16–271 |
+
+**Reserved opcodes**
+- End of stream: `0x06`, followed by 7 zero bytes (8 bytes in total).
+- No-op: `0x0E` and `0x16`.
+- Undefined, so a decode error: `0x1E`, `0x26`, `0x2E`, `0x36`, `0x3E`, `0x70`–`0x7F` and `0xD0`–`0xDF`.
+- Because of those, some (L, M) combinations have no opcode in the forms that store M in 3 bits (`sml_d`, `lrg_d`, `pre_d`):
+  - L = 1 allows M ≤ 8;
+  - L = 2 allows M ≤ 6;
+  - L = 3 allows M ≤ 4;
+  - `pre_d` with L = 0 is not available.
+  The encoder must avoid the missing combinations.
+
+**Decoder rules**
+- Every opcode except end-of-stream needs at least one more input byte after its literals.
+- A distance of 0, or one larger than the output written so far, is an error.
+
+**Verified:** we confirmed the opcode set by hand-decoding output from `libcompression` algorithm `0x900`.
 
 ### 3.4 APFS transparent compression (decmpfs)
 
@@ -141,12 +208,13 @@ docs/            this design, benchmark reports
 
 - **The decmpfs case:** chunks are independent, so we use scoped threads over a work queue.
 - **Thread priority:** chosen through macOS QoS classes. User-initiated work runs on the P-cores. The `free-disk-space` daemon runs at utility or background priority on the E-cores.
-- **Large single streams:** blocks are encoded in parallel and concatenated. This is valid because LZFSE blocks are self-contained (**verify**: no state carried across blocks).
+- **Large single streams:** blocks are **not** self-contained. A match may reach back into earlier blocks, because the decoder checks the distance against the whole output so far, up to 262,139 bytes. The repeat-distance state does reset at every block. So a single stream can only be encoded in parallel by cutting it into independent segments, at some cost in ratio. The decmpfs case does not have this problem, since every 64 KiB chunk is its own stream.
 
 ### 5.4 Build
 
-- `-C target-cpu=apple-m1` for Apple Silicon release builds.
-- Universal binaries keep a portable x86-64 slice.
+- `-C target-cpu=apple-m1` for Apple Silicon release builds. The M1 is the minimum supported chip.
+- Later, if measurements show a gain, add separate builds tuned for M2, M3 and newer, picked at runtime. That is not part of the first version.
+- No Intel slice.
 - Profile-guided optimisation (PGO) is an optional later step.
 
 ### 5.5 Ruled out, for now
@@ -239,16 +307,17 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 | # | Deliverable | Done when |
 |---|---|---|
 | M0 | This document, workspace skeleton, CI on macOS and Linux, lint rules | The plan is approved and CI is green on an empty workspace |
-| M1 | Decoder: `bvx-`, `bvxn`, `bvx1`, `bvx2`, `bvx$` | It decodes Apple's golden vectors, decoder fuzzing is clean, and every **verify** in sections 3.1–3.3 is resolved |
+| M1 | Decoder: `bvx-`, `bvxn`, `bvx1`, `bvx2`, `bvx$` | It decodes Apple's output in CI and the decoder fuzz and property tests are clean |
 | M2 | Scalar encoder: LZVN and LZFSE `bvx2` | The compatibility matrix is green and the ratio is within 2% of Apple's |
 | M3 | Benchmark harness and first report | A reproducible baseline report against `libcompression` and the reference |
 | M4 | Optimisation: parallel chunks, then kernels (Rust, then NEON, then C or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential fuzzing |
 | M5 | decmpfs writer and `free-disk-space` integration | Type 12 files read back through the kernel. The section 3.4 **verify** items are resolved |
 
-## 9. Open questions for the owner
+## 9. Owner decisions
 
-1. **Baseline chip:** M1 as the minimum, with tuning on your own machine? Which M chip is that?
-2. **Intel Macs:** portable path only, or worth an SSE/AVX2 backend?
-3. **Ratio target:** is "no more than 0.5% worse than Apple's" the right trade-off, or should speed win outright?
-4. **Crate name on crates.io:** the names `lzfse` and `lzfse_rust` are taken.
-5. **`no_std` support** (for embedded use or other operating systems): worth designing in now?
+1. **Chips:** the M1 is the minimum (the owner uses an M1 at home and an M3 at work).
+2. **Intel Macs:** not supported.
+3. **Ratio target:** no more than 0.5% worse than Apple's.
+4. **Crate name:** `lzfse-zazzcat`.
+5. **`no_std`:** supported. The library builds without `std`, using `alloc`. Threads and other OS-dependent parts need the default `std` feature.
+6. **Per-chip builds:** M2/M3-tuned builds come later, only if measured to help (section 5.4).

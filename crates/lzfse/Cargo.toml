@@ -1,0 +1,18 @@
+[package]
+name = "lzfse-zazzcat"
+description = "LZFSE and LZVN compression (Apple's formats), written from scratch in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["lzfse", "lzvn", "compression", "apple", "decmpfs"]
+categories = ["compression", "no-std"]
+
+[features]
+default = ["std"]
+# Threads (block-parallel chunk compression) and `std::error::Error`.
+std = []
+
+[dev-dependencies]
+proptest = "1"
