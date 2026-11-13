@@ -166,26 +166,37 @@ fn one_shot_allocations_are_bounded() {
     );
 }
 
-// Chunked compression makes one exact-size allocation per chunk, plus a fixed amount per worker thread (the
-// thread itself, its encoder and its scratch buffers).
+// Chunked compression returns exact-size streams, and the contiguous form allocates nothing once its buffers,
+// the workers' encoders and the buffer pool have warmed up.
 #[test]
-fn chunk_outputs_are_exact() {
+fn chunked_encoding() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let big = text(4 << 20);
+    let opts = lzfse::Options::default();
     let mut parts = Vec::new();
-    let threads = 4;
-    let c = count_all_threads(|| {
-        parts = lzfse::encode_chunks_with(&big, 65_536, threads, &lzfse::Options::default())
-    });
-    println!("encode_chunks 4 MiB in 64 KiB chunks: {c:?}");
+    let c = count_all_threads(|| parts = lzfse::encode_chunks_with(&big, 65_536, &opts));
+    println!("encode_chunks_with 4 MiB in 64 KiB chunks: {c:?}");
     assert!(
         parts.iter().all(|p| p.capacity() == p.len()),
         "chunk outputs carry unused capacity"
     );
+    let (mut arena, mut offsets) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        arena.clear();
+        lzfse::encode_chunks_into(&big, 65_536, &opts, &mut arena, &mut offsets);
+    }
+    arena.clear();
+    let c = count_all_threads(|| {
+        lzfse::encode_chunks_into(&big, 65_536, &opts, &mut arena, &mut offsets)
+    });
+    println!("encode_chunks_into, warmed up: {c:?}");
+    assert_eq!(offsets.len(), parts.len() + 1);
+    for (w, p) in offsets.windows(2).zip(&parts) {
+        assert_eq!(arena[w[0]..w[1]], p[..]);
+    }
     assert!(
-        c.0 <= parts.len() + threads * 24 + 16,
-        "{} allocations for {} chunks",
-        c.0,
-        parts.len()
+        c.0 <= 4,
+        "warmed-up chunked encoding made {} allocations",
+        c.0
     );
 }

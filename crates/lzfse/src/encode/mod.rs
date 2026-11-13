@@ -77,6 +77,11 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Change the options for later calls; the tables are kept (and grown if needed).
+    pub fn set_options(&mut self, opts: Options) {
+        self.opts = opts;
+    }
+
     /// Create an encoder with the given options.
     pub fn new(opts: Options) -> Self {
         Encoder {

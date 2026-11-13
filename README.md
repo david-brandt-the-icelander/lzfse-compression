@@ -37,6 +37,7 @@ Closing that gap is the current work (see [`docs/DESIGN.md`](docs/DESIGN.md), se
 | Crate / path | What it is |
 |---|---|
 | `crates/lzfse` (`lzfse-zazzcat`) | The codec: LZFSE and LZVN, encoder and decoder, `no_std` + `alloc` |
+| `encode_chunks_into` | Parallel chunked compression on a persistent thread pool, written straight into the APFS resource-fork layout; no allocations once warmed up |
 | `lzfse_zazzcat::decmpfs` | APFS transparent compression containers (types 7, 8, 11, 12) |
 | `crates/lzfse-cli` | `lzfse-zazzcat encode|decode|inspect` |
 | `crates/lzfse-bench` | In-process benchmark against `libcompression` |

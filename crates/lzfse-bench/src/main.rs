@@ -207,7 +207,7 @@ fn ours<'a>(
     let opts = lzfse::Options::default();
     let encode_all = move || -> Vec<Vec<u8>> {
         if threads > 1 {
-            lzfse::encode_chunks_with(data, chunk, threads, &opts)
+            lzfse::encode_chunks_with(data, chunk, &opts)
         } else {
             let mut enc = lzfse::Encoder::new(opts);
             pieces
@@ -256,10 +256,21 @@ fn ours<'a>(
             }
         })
     };
+    // The timed parallel encode is the allocation-free contiguous form, as a decmpfs writer would use it.
+    let (mut arena, mut offsets) = (Vec::new(), Vec::new());
+    let enc: Box<dyn FnMut() + 'a> = if threads > 1 {
+        Box::new(move || {
+            arena.clear();
+            lzfse::encode_chunks_into(data, chunk, &opts, &mut arena, &mut offsets);
+            std::hint::black_box(&arena);
+        })
+    } else {
+        Box::new(move || drop(std::hint::black_box(encode_all())))
+    };
     Contender {
         name,
         packed: size,
-        enc: Box::new(move || drop(std::hint::black_box(encode_all()))),
+        enc,
         dec,
     }
 }
@@ -405,9 +416,7 @@ fn main() {
     if chunks.is_empty() {
         chunks = vec![65_536, 1 << 20, usize::MAX];
     }
-    let threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let threads = lzfse::parallelism().max(1);
     let mut rows = Vec::new();
     for input in &inputs {
         for &chunk in &chunks {

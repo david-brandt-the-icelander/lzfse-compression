@@ -78,11 +78,47 @@ pub fn from_chunks(size: u64, chunks: &[Vec<u8>]) -> Compressed {
 
 /// Compress file contents into decmpfs attributes (LZFSE), using all cores when the `std` feature is on.
 pub fn compress(data: &[u8]) -> Compressed {
+    let n = data.len().div_ceil(CHUNK);
+    let table = 4 * (n + 1);
+    // Encode the chunks straight into the fork after a placeholder for the offset table, then fill in the table.
+    let mut fork = alloc::vec![0u8; table];
     #[cfg(feature = "std")]
-    let chunks = crate::encode_chunks(data, CHUNK);
+    let offsets = {
+        let mut offsets = Vec::new();
+        crate::encode_chunks_into(
+            data,
+            CHUNK,
+            &crate::Options::default(),
+            &mut fork,
+            &mut offsets,
+        );
+        offsets
+    };
     #[cfg(not(feature = "std"))]
-    let chunks: Vec<Vec<u8>> = data.chunks(CHUNK).map(crate::encode).collect();
-    from_chunks(data.len() as u64, &chunks)
+    let offsets = {
+        let mut offsets = alloc::vec![table];
+        let mut enc = crate::Encoder::new(crate::Options::default());
+        for piece in data.chunks(CHUNK) {
+            enc.encode(piece, &mut fork);
+            offsets.push(fork.len());
+        }
+        offsets
+    };
+    if n == 1 && 16 + fork.len() - table <= MAX_XATTR {
+        let mut xattr = header(TYPE_LZFSE_INLINE, data.len() as u64).to_vec();
+        xattr.extend_from_slice(&fork[table..]);
+        return Compressed {
+            xattr,
+            fork: Vec::new(),
+        };
+    }
+    for (i, &o) in offsets.iter().enumerate() {
+        fork[4 * i..4 * i + 4].copy_from_slice(&(o as u32).to_le_bytes());
+    }
+    Compressed {
+        xattr: header(TYPE_LZFSE_FORK, data.len() as u64).to_vec(),
+        fork,
+    }
 }
 
 /// Return (type, uncompressed size) from a `com.apple.decmpfs` attribute.

@@ -215,7 +215,16 @@ docs/            this design, benchmark reports
 
 ### 5.3 Parallelism
 
-- **The decmpfs case:** chunks are independent, so we use scoped threads over a work queue.
+- **The decmpfs case:** chunks are independent, so they are encoded on `rayon`'s persistent work-stealing pool.
+  - **Why `rayon`:** it keeps its threads alive between calls and can safely borrow the caller's input, which std's
+    scoped threads can only do by spawning fresh threads each call. Like every crate dependency, it is statically
+    linked.
+  - **Per-worker reuse:** each worker thread keeps its own `Encoder`, and chunk outputs go through a pool of reused
+    buffers.
+  - **`encode_chunks_into`:** writes the streams back to back plus an offset table, which is the resource-fork
+    layout. Once warmed up, it allocates nothing (`tests/alloc.rs`).
+- **One-shot functions:** `encode()` and `decode()` deliberately keep no global state. Long-lived callers reuse an
+  `Encoder` or `Decoder`, which allocates nothing per call.
 - **Thread priority:** chosen through macOS QoS classes. User-initiated work runs on the P-cores. The `free-disk-space` daemon runs at utility or background priority on the E-cores.
 - **Large single streams:** blocks are **not** self-contained. A match may reach back into earlier blocks, because the decoder checks the distance against the whole output so far, up to 262,139 bytes. The repeat-distance state does reset at every block. So a single stream can only be encoded in parallel by cutting it into independent segments, at some cost in ratio. The decmpfs case does not have this problem, since every 64 KiB chunk is its own stream.
 
