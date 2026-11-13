@@ -177,73 +177,66 @@ fn synthetic() -> Vec<Input> {
     ]
 }
 
-// Run `f` repeatedly and return the median seconds per run.
-fn time(runs: usize, mut f: impl FnMut()) -> f64 {
-    f();
-    let mut samples: Vec<f64> = (0..runs)
-        .map(|_| {
-            let t = Instant::now();
-            f();
-            t.elapsed().as_secs_f64()
-        })
-        .collect();
-    samples.sort_by(|a, b| a.total_cmp(b));
-    samples[samples.len() / 2]
-}
-
 // Megabytes (10^6 bytes) per second.
 fn mbs(bytes: usize, secs: f64) -> f64 {
     bytes as f64 / secs / 1e6
 }
 
-// Encoded chunks plus the timing of producing them, checked to decode back to the input.
-fn measure_ours(
-    input: &Input,
+// Median of a list of timings.
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[v.len() / 2]
+}
+
+// A contender ready to time: closures that encode every chunk once and decode every stream once.
+struct Contender<'a> {
+    name: &'static str,
+    packed: usize,
+    enc: Box<dyn FnMut() + 'a>,
+    dec: Box<dyn FnMut() + 'a>,
+}
+
+// Encode the chunks with our encoder (on `threads` threads), check the result, and return the timing closures.
+fn ours<'a>(
+    name: &'static str,
+    pieces: &'a [&'a [u8]],
+    data: &'a [u8],
     chunk: usize,
-    runs: usize,
     threads: usize,
-    contender: &'static str,
-    shape: &str,
-) -> Row {
-    let pieces: Vec<&[u8]> = input.data.chunks(chunk).collect();
+) -> Contender<'a> {
     let opts = lzfse::Options::default();
-    let encode_all = || -> Vec<Vec<u8>> {
+    let encode_all = move || -> Vec<Vec<u8>> {
         if threads > 1 {
-            lzfse::encode_chunks_with(&input.data, chunk, threads, &opts)
+            lzfse::encode_chunks_with(data, chunk, threads, &opts)
         } else {
-            {
-                let mut enc = lzfse::Encoder::new(opts);
-                pieces
-                    .iter()
-                    .map(|p| {
-                        let mut out = Vec::with_capacity(p.len() / 2 + 64);
-                        enc.encode(p, &mut out);
-                        out
-                    })
-                    .collect()
-            }
+            let mut enc = lzfse::Encoder::new(opts);
+            pieces
+                .iter()
+                .map(|p| {
+                    let mut out = Vec::with_capacity(p.len() / 2 + 64);
+                    enc.encode(p, &mut out);
+                    out
+                })
+                .collect()
         }
     };
     let packed = encode_all();
     let mut out = vec![0u8; chunk];
-    for (p, src) in packed.iter().zip(&pieces) {
+    for (p, src) in packed.iter().zip(pieces) {
         let n = lzfse::decode_into(p, &mut out).expect("our stream decodes");
-        assert_eq!(&out[..n], *src, "round trip of {}", input.name);
+        assert_eq!(&out[..n], *src, "round trip");
         #[cfg(target_os = "macos")]
         {
-            let mut a = apple::Codec::new();
             let mut buf = vec![0u8; src.len() + 1];
-            let n = a.decode(p, &mut buf);
-            assert_eq!(&buf[..n], *src, "Apple decodes our {}", input.name);
+            let n = apple::Codec::new().decode(p, &mut buf);
+            assert_eq!(&buf[..n], *src, "Apple decodes our stream");
         }
     }
-    let enc = time(runs, || {
-        std::hint::black_box(encode_all());
-    });
+    let size = packed.iter().map(Vec::len).sum();
     let mut decoder = lzfse::Decoder::new();
-    let dec = if threads > 1 {
+    let dec: Box<dyn FnMut() + 'a> = if threads > 1 {
         // Each worker decodes every `threads`-th chunk with its own decoder and output buffer.
-        time(runs, || {
+        Box::new(move || {
             thread::scope(|sc| {
                 for t in 0..threads {
                     let packed = &packed;
@@ -257,53 +250,93 @@ fn measure_ours(
             })
         })
     } else {
-        time(runs, || {
+        Box::new(move || {
             for p in &packed {
                 std::hint::black_box(decoder.decode_into(p, &mut out).unwrap());
             }
         })
     };
-    Row {
-        contender,
-        input: input.name.clone(),
-        shape: shape.into(),
-        size: input.data.len(),
-        packed: packed.iter().map(Vec::len).sum(),
-        enc_mbs: mbs(input.data.len(), enc),
-        dec_mbs: mbs(input.data.len(), dec),
+    Contender {
+        name,
+        packed: size,
+        enc: Box::new(move || drop(std::hint::black_box(encode_all()))),
+        dec,
     }
 }
 
 #[cfg(target_os = "macos")]
-// Time Apple's LZFSE on the same chunks, checking its output with our decoder.
-fn measure_apple(input: &Input, chunk: usize, runs: usize, shape: &str) -> Row {
-    let pieces: Vec<&[u8]> = input.data.chunks(chunk).collect();
+// Encode the chunks with Apple's LZFSE, check them with our decoder, and return the timing closures.
+fn apple_contender<'a>(pieces: &'a [&'a [u8]], chunk: usize) -> Contender<'a> {
     let mut codec = apple::Codec::new();
     let packed: Vec<Vec<u8>> = pieces.iter().map(|p| codec.encode(p)).collect();
     let mut out = vec![0u8; chunk];
-    for (p, src) in packed.iter().zip(&pieces) {
+    for (p, src) in packed.iter().zip(pieces) {
         let n = lzfse::decode_into(p, &mut out).expect("we decode Apple's stream");
         assert_eq!(&out[..n], *src);
     }
-    let enc = time(runs, || {
-        for p in &pieces {
-            std::hint::black_box(codec.encode(p));
-        }
-    });
-    let dec = time(runs, || {
-        for p in &packed {
-            std::hint::black_box(codec.decode(p, &mut out));
-        }
-    });
-    Row {
-        contender: "apple libcompression",
-        input: input.name.clone(),
-        shape: shape.into(),
-        size: input.data.len(),
-        packed: packed.iter().map(Vec::len).sum(),
-        enc_mbs: mbs(input.data.len(), enc),
-        dec_mbs: mbs(input.data.len(), dec),
+    let size = packed.iter().map(Vec::len).sum();
+    let mut dec_codec = apple::Codec::new();
+    Contender {
+        name: "apple libcompression",
+        packed: size,
+        enc: Box::new(move || {
+            for p in pieces {
+                std::hint::black_box(codec.encode(p));
+            }
+        }),
+        dec: Box::new(move || {
+            for p in &packed {
+                std::hint::black_box(dec_codec.decode(p, &mut out));
+            }
+        }),
     }
+}
+
+// Time every contender on one input and chunk size, interleaving them run by run so that noise from other
+// tenants of a shared machine hits all of them alike.
+fn measure(input: &Input, chunk: usize, runs: usize, threads: usize) -> Vec<Row> {
+    let pieces: Vec<&[u8]> = input.data.chunks(chunk).collect();
+    let mut cs: Vec<Contender> = Vec::new();
+    #[cfg(target_os = "macos")]
+    cs.push(apple_contender(&pieces, chunk));
+    cs.push(ours("lzfse-zazzcat", &pieces, &input.data, chunk, 1));
+    if threads > 1 && chunk < input.data.len() {
+        cs.push(ours(
+            "lzfse-zazzcat parallel",
+            &pieces,
+            &input.data,
+            chunk,
+            threads,
+        ));
+    }
+    let mut samples = vec![(Vec::new(), Vec::new()); cs.len()];
+    for c in &mut cs {
+        (c.enc)();
+        (c.dec)();
+    }
+    for _ in 0..runs {
+        for (c, (e, d)) in cs.iter_mut().zip(samples.iter_mut()) {
+            let t = Instant::now();
+            (c.enc)();
+            e.push(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            (c.dec)();
+            d.push(t.elapsed().as_secs_f64());
+        }
+    }
+    let s = shape(chunk, input.data.len());
+    cs.iter()
+        .zip(samples)
+        .map(|(c, (e, d))| Row {
+            contender: c.name,
+            input: input.name.clone(),
+            shape: s.clone(),
+            size: input.data.len(),
+            packed: c.packed,
+            enc_mbs: mbs(input.data.len(), median(e)),
+            dec_mbs: mbs(input.data.len(), median(d)),
+        })
+        .collect()
 }
 
 // Describe a chunk size for the report.
@@ -329,7 +362,7 @@ fn report(rows: &[Row], threads: usize) {
         }
     }
     println!("- Threads for the parallel rows: {threads}");
-    println!("- Throughput is MB/s (10^6 bytes) of uncompressed data; median of the timed runs.\n");
+    println!("- Throughput is MB/s (10^6 bytes) of uncompressed data: the median of the timed runs, with the contenders interleaved run by run.\n");
     println!("| Input | Shape | Contender | Ratio | Encode MB/s | Decode MB/s |");
     println!("|---|---|---|---:|---:|---:|");
     for r in rows {
@@ -379,21 +412,8 @@ fn main() {
     for input in &inputs {
         for &chunk in &chunks {
             let chunk = chunk.min(input.data.len().max(1));
-            let s = shape(chunk, input.data.len());
-            #[cfg(target_os = "macos")]
-            rows.push(measure_apple(input, chunk, runs, &s));
-            rows.push(measure_ours(input, chunk, runs, 1, "lzfse-zazzcat", &s));
-            if threads > 1 && chunk < input.data.len() {
-                rows.push(measure_ours(
-                    input,
-                    chunk,
-                    runs,
-                    threads,
-                    "lzfse-zazzcat parallel",
-                    &s,
-                ));
-            }
-            eprintln!("done: {} {s}", input.name);
+            rows.extend(measure(input, chunk, runs, threads));
+            eprintln!("done: {} {}", input.name, shape(chunk, input.data.len()));
         }
     }
     report(&rows, threads);

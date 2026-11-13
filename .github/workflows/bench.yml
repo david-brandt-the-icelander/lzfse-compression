@@ -24,7 +24,7 @@ jobs:
         env:
           RUSTFLAGS: -C target-cpu=apple-m1
         run: |
-          cargo run --release -p lzfse-bench -- --runs 7 > report.md
+          cargo run --release -p lzfse-bench -- --runs 11 > report.md
           cat report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
