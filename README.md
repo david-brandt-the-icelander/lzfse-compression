@@ -17,8 +17,8 @@ let unpacked = lzfse_zazzcat::decode(&packed, data.len())?;
 Measured against `libcompression` in the same process on GitHub's Apple Silicon runners. The full table and
 method are in [`docs/benchmarks`](docs/benchmarks/2026-11-13-github-m2pro.md).
 
-- **Every core.** Independent chunks are compressed and decompressed on all cores (`encode_chunks`). That is how
-  APFS stores files, in 64 KiB chunks. Apple's API is single-threaded. On a 5-thread M2 Pro runner, text encodes
+- **Every core.** `encode_chunks` compresses independent chunks on all cores, which is how APFS stores files
+  (64 KiB chunks). The chunks are separate streams, so they decode in parallel too. Apple's API is single-threaded. On a 5-thread M2 Pro runner, text encodes
   about 4× faster than Apple's and decodes about 3× faster.
 - **Incompressible data is stored, not coded.** Blocks that do not shrink become raw blocks:
   - media and already-compressed files decode at memory speed, about 40× faster than Apple's;
