@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::vec::Vec;
 
-use crate::encode::{encode_with, Options};
+use crate::encode::{Encoder, Options};
 
 /// Compress `src` in independent `chunk`-byte pieces on all available cores; each result is a complete stream.
 pub fn encode_chunks(src: &[u8], chunk: usize) -> Vec<Vec<u8>> {
@@ -23,8 +23,14 @@ pub fn encode_chunks_with(
     assert!(chunk > 0, "chunk size must be positive");
     let pieces: Vec<&[u8]> = src.chunks(chunk).collect();
     let threads = threads.clamp(1, pieces.len().max(1));
+    let encode_one = |enc: &mut Encoder, p: &[u8]| {
+        let mut out = Vec::with_capacity(p.len() / 2 + 64);
+        enc.encode(p, &mut out);
+        out
+    };
     if threads == 1 {
-        return pieces.iter().map(|p| encode_with(p, opts)).collect();
+        let mut enc = Encoder::new(*opts);
+        return pieces.iter().map(|p| encode_one(&mut enc, p)).collect();
     }
     // Workers take the next unclaimed chunk until none are left, then results are put back in order.
     let next = AtomicUsize::new(0);
@@ -32,11 +38,12 @@ pub fn encode_chunks_with(
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| {
+                    let mut enc = Encoder::new(*opts);
                     let mut done = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(p) = pieces.get(i) else { return done };
-                        done.push((i, encode_with(p, opts)));
+                        done.push((i, encode_one(&mut enc, p)));
                     }
                 })
             })

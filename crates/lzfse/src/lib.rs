@@ -32,7 +32,7 @@ pub mod lzvn;
 mod parallel;
 
 pub use decode::{decode, decode_into, decoded_len};
-pub use encode::{encode, encode_with, Options, LZVN_THRESHOLD};
+pub use encode::{encode, encode_with, Encoder, Options, LZVN_THRESHOLD};
 pub use error::Error;
 #[cfg(feature = "std")]
 pub use parallel::{encode_chunks, encode_chunks_with};

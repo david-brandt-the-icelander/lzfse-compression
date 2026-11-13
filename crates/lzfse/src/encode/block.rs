@@ -5,56 +5,63 @@ use crate::bits::BitWriter;
 use crate::format::*;
 use crate::fse;
 
-// Token buffer for the block being built, plus the encoded stream so far.
-pub struct Blocks<'a> {
-    src: &'a [u8],
+// Token buffers for the block being built; reused across blocks and calls.
+pub struct Blocks {
     block_start: usize,
     raw: usize,
     l: Vec<u32>,
     m: Vec<u32>,
     d: Vec<u32>,
     lits: Vec<u8>,
-    pub out: Vec<u8>,
 }
 
-impl<'a> Blocks<'a> {
-    // Start collecting tokens for `src` from offset `start`, appending blocks to `out`.
-    pub fn new(src: &'a [u8], start: usize, out: Vec<u8>) -> Self {
+impl Blocks {
+    // Allocate empty buffers sized for a full block.
+    pub fn new() -> Self {
         Blocks {
-            src,
-            block_start: start,
+            block_start: 0,
             raw: 0,
             l: Vec::with_capacity(MATCHES_PER_BLOCK),
             m: Vec::with_capacity(MATCHES_PER_BLOCK),
             d: Vec::with_capacity(MATCHES_PER_BLOCK),
-            lits: Vec::with_capacity(LITERALS_PER_BLOCK),
-            out,
+            lits: Vec::with_capacity(LITERALS_PER_BLOCK + 4),
         }
     }
 
+    // Start a new input whose first block begins at offset 0 of its source.
+    pub fn reset(&mut self) {
+        self.block_start = 0;
+        self.raw = 0;
+        self.l.clear();
+        self.m.clear();
+        self.d.clear();
+        self.lits.clear();
+    }
+
     // Add literals followed by a match of `m` bytes at distance `d` (m = 0 for trailing literals), splitting
-    // values that exceed the format's limits.
-    pub fn push(&mut self, mut lits: &[u8], mut m: u32, d: u32) {
+    // values that exceed the format's limits; full blocks of `src` are written to `out`.
+    pub fn push(&mut self, src: &[u8], mut lits: &[u8], mut m: u32, d: u32, out: &mut Vec<u8>) {
         while lits.len() > MAX_L as usize {
-            self.token(&lits[..MAX_L as usize], 0, 0);
+            self.token(src, &lits[..MAX_L as usize], 0, 0, out);
             lits = &lits[MAX_L as usize..];
         }
         while m > MAX_M {
-            self.token(lits, MAX_M, d);
+            self.token(src, lits, MAX_M, d, out);
             lits = &[];
             m -= MAX_M;
         }
         if !lits.is_empty() || m > 0 {
-            self.token(lits, m, d);
+            self.token(src, lits, m, d, out);
         }
     }
 
     // Append one in-range token, closing the block first if it is full.
-    fn token(&mut self, lits: &[u8], m: u32, d: u32) {
+    #[inline(always)]
+    fn token(&mut self, src: &[u8], lits: &[u8], m: u32, d: u32, out: &mut Vec<u8>) {
         if self.l.len() + 1 > MATCHES_PER_BLOCK
             || self.lits.len() + lits.len() + 3 > LITERALS_PER_BLOCK
         {
-            self.flush();
+            self.flush(src, out);
         }
         self.l.push(lits.len() as u32);
         self.m.push(m);
@@ -64,25 +71,24 @@ impl<'a> Blocks<'a> {
     }
 
     // Encode the buffered tokens as one block, falling back to a raw block if that is smaller.
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self, src: &[u8], out: &mut Vec<u8>) {
         if self.l.is_empty() {
             return;
         }
-        let mark = self.out.len();
+        let mark = out.len();
         encode_block(
             &self.l,
             &self.m,
-            &self.d,
+            &mut self.d,
             &mut self.lits,
             self.raw as u32,
-            &mut self.out,
+            out,
         );
-        if self.out.len() - mark >= self.raw + RAW_HEADER_SIZE {
-            self.out.truncate(mark);
-            self.out.extend_from_slice(&MAGIC_RAW.to_le_bytes());
-            self.out.extend_from_slice(&(self.raw as u32).to_le_bytes());
-            self.out
-                .extend_from_slice(&self.src[self.block_start..self.block_start + self.raw]);
+        if out.len() - mark >= self.raw + RAW_HEADER_SIZE {
+            out.truncate(mark);
+            out.extend_from_slice(&MAGIC_RAW.to_le_bytes());
+            out.extend_from_slice(&(self.raw as u32).to_le_bytes());
+            out.extend_from_slice(&src[self.block_start..self.block_start + self.raw]);
         }
         self.block_start += self.raw;
         self.raw = 0;
@@ -97,7 +103,7 @@ impl<'a> Blocks<'a> {
 fn encode_block(
     l: &[u32],
     m: &[u32],
-    d: &[u32],
+    dv: &mut [u32],
     lits: &mut Vec<u8>,
     n_raw: u32,
     out: &mut Vec<u8>,
@@ -106,14 +112,13 @@ fn encode_block(
         lits.push(0);
     }
     // Distance 0 means "same as the previous token"; literal-only tokens reuse the previous distance too.
-    let mut dv = Vec::with_capacity(d.len());
     let mut prev: Option<u32> = None;
-    for (&dist, &len) in d.iter().zip(m) {
-        let want = if len == 0 { prev.unwrap_or(1) } else { dist };
+    for (dist, &len) in dv.iter_mut().zip(m) {
+        let want = if len == 0 { prev.unwrap_or(1) } else { *dist };
         if prev == Some(want) {
-            dv.push(0);
+            *dist = 0;
         } else {
-            dv.push(want);
+            *dist = want;
             prev = Some(want);
         }
     }

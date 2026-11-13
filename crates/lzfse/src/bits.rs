@@ -85,9 +85,11 @@ impl<'a> BitReader<'a> {
             return Ok(());
         }
         let start = self.pos.checked_sub(bytes).ok_or(Error::Corrupt)?;
+        // `start + 8` never passes the end: `new` consumed at least 7 bytes and `pos` only moves backwards.
         let mut le = [0u8; 8];
-        le[..bytes].copy_from_slice(&self.buf[start..self.pos]);
-        self.accum = (self.accum << (8 * bytes)) | u64::from_le_bytes(le);
+        le.copy_from_slice(&self.buf[start..start + 8]);
+        let incoming = u64::from_le_bytes(le) & ((1u64 << (8 * bytes)) - 1);
+        self.accum = (self.accum << (8 * bytes)) | incoming;
         self.nbits += 8 * bytes as u32;
         self.pos = start;
         Ok(())

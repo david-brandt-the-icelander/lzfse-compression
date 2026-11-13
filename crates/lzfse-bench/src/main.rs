@@ -211,10 +211,17 @@ fn measure_ours(
         if threads > 1 {
             lzfse::encode_chunks_with(&input.data, chunk, threads, &opts)
         } else {
-            pieces
-                .iter()
-                .map(|p| lzfse::encode_with(p, &opts))
-                .collect()
+            {
+                let mut enc = lzfse::Encoder::new(opts);
+                pieces
+                    .iter()
+                    .map(|p| {
+                        let mut out = Vec::with_capacity(p.len() / 2 + 64);
+                        enc.encode(p, &mut out);
+                        out
+                    })
+                    .collect()
+            }
         }
     };
     let packed = encode_all();
