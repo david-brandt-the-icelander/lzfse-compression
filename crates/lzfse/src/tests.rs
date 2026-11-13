@@ -124,12 +124,12 @@ fn far_matches() {
 fn options_round_trip() {
     let data = words(150_000);
     for hash_bits in [10, 14, 16] {
-        for lazy in [false, true] {
+        for lazy_below in [0, 8, 64] {
             for skip_shift in [0, 2, 6] {
                 let o = Options {
                     hash_bits,
                     good_match: 24,
-                    lazy,
+                    lazy_below,
                     skip_shift,
                 };
                 assert_eq!(decode(&encode_with(&data, &o), data.len()).unwrap(), data);

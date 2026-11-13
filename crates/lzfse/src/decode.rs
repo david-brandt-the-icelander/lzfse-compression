@@ -8,6 +8,31 @@ use crate::fse::{self, LitEntry, ValueEntry};
 use crate::kernels::{copy_match, copy_match_wild, wild_copy, SLACK};
 use crate::{lzvn, Error};
 
+/// A reusable decoder: its tables and literal buffer carry over between calls, which helps when decoding many
+/// small streams (such as 64 KiB chunks).
+pub struct Decoder {
+    s: Scratch,
+}
+
+impl Default for Decoder {
+    // Same as `Decoder::new`.
+    fn default() -> Self {
+        Decoder::new()
+    }
+}
+
+impl Decoder {
+    /// Create a decoder; buffers are allocated on first use.
+    pub fn new() -> Self {
+        Decoder { s: Scratch::new() }
+    }
+
+    /// Decode a stream into `dst` and return the number of bytes written.
+    pub fn decode_into(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
+        decode_with(src, dst, &mut self.s)
+    }
+}
+
 // Reusable per-block decoding tables and literal buffer.
 struct Scratch {
     lit: Vec<LitEntry>,
@@ -95,7 +120,11 @@ pub fn decode(src: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
 
 /// Decode a stream into `dst` and return the number of bytes written.
 pub fn decode_into(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
-    let mut scratch = Scratch::new();
+    decode_with(src, dst, &mut Scratch::new())
+}
+
+// Decode a stream into `dst` using `scratch` for tables and literals.
+fn decode_with(src: &[u8], dst: &mut [u8], scratch: &mut Scratch) -> Result<usize, Error> {
     let (mut at, mut pos) = (0usize, 0usize);
     loop {
         match read_u32(src, at)? {
@@ -134,8 +163,8 @@ pub fn decode_into(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
                     return Err(Error::Truncated);
                 }
                 // The literal stream may read back into earlier bytes of the input, as Apple's decoder does.
-                decode_literals(&h, &src[..lmd_start], &mut scratch)?;
-                pos = decode_tokens(&h, &src[lmd_start..lmd_end], &mut scratch, dst, pos)?;
+                decode_literals(&h, &src[..lmd_start], scratch)?;
+                pos = decode_tokens(&h, &src[lmd_start..lmd_end], scratch, dst, pos)?;
                 at = lmd_end;
             }
             _ => return Err(Error::Corrupt),
@@ -147,8 +176,10 @@ pub fn decode_into(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
 fn decode_literals(h: &BlockHeader, src: &[u8], s: &mut Scratch) -> Result<(), Error> {
     fse::literal_table(&h.lit_freq, LIT_STATES, &mut s.lit)?;
     let count = (h.n_literals as usize + 3) & !3;
-    s.literals.clear();
-    s.literals.resize(count + SLACK, 0);
+    // Only grow the buffer: every literal up to `count` is overwritten below and the slack is never read as output.
+    if s.literals.len() < count + SLACK {
+        s.literals.resize(count + SLACK, 0);
+    }
     let mut r = BitReader::new(src, h.literal_bits)?;
     let table: &[LitEntry; LIT_STATES as usize] =
         s.lit.as_slice().try_into().map_err(|_| Error::Corrupt)?;
@@ -183,7 +214,7 @@ fn decode_tokens(
     let mut r = BitReader::new(lmd, h.lmd_bits)?;
     let (mut ls, mut ms, mut ds) = (h.l_state as u32, h.m_state as u32, h.d_state as u32);
     let mut lit = 0usize;
-    let n_lits = s.literals.len() - SLACK;
+    let n_lits = (h.n_literals as usize + 3) & !3;
     let mut d_prev: Option<usize> = None;
     for _ in 0..h.n_matches {
         r.refill()?;

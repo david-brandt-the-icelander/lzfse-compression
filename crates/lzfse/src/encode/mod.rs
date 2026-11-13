@@ -24,8 +24,9 @@ pub struct Options {
     pub hash_bits: u32,
     /// Stop searching (and skip lazy evaluation) once a match is at least this long.
     pub good_match: usize,
-    /// Try a match one byte later before committing to the current one.
-    pub lazy: bool,
+    /// Try a match one byte later before committing to the current one, if the current one is shorter than this
+    /// (0 disables). Longer matches rarely improve, so checking them costs speed for no ratio.
+    pub lazy_below: usize,
     /// After `2^skip_shift` consecutive positions without a match, step further ahead (0 disables skipping).
     pub skip_shift: u32,
 }
@@ -36,7 +37,7 @@ impl Default for Options {
         Options {
             hash_bits: 14,
             good_match: 40,
-            lazy: true,
+            lazy_below: 8,
             skip_shift: 6,
         }
     }
@@ -147,14 +148,14 @@ impl Encoder {
                 continue;
             };
             misses = 0;
-            if opts.lazy && m.len < opts.good_match && i + 1 < limit {
+            if m.len < opts.lazy_below && i + 1 < limit {
                 if let Some(next) = f.find(i + 1, lit, d_prev) {
                     if next.len > m.len {
                         m = next;
                     }
                 }
             }
-            blocks.push(src, &src[lit..m.start], m.len as u32, m.dist as u32, out);
+            blocks.push(src, lit, m.start, m.len as u32, m.dist as u32, out);
             d_prev = m.dist;
             let end = m.start + m.len;
             // Index positions inside the match so later data can refer to them; long matches only at their edges.
@@ -170,7 +171,7 @@ impl Encoder {
             i = end;
             lit = end;
         }
-        blocks.push(src, &src[lit..], 0, 0, out);
+        blocks.push(src, lit, src.len(), 0, 0, out);
         blocks.flush(src, out);
         // The next input's positions start past everything stored now, so none of these entries look valid then.
         self.base += src.len() as u32 + 1;
@@ -238,8 +239,12 @@ impl Finder<'_> {
                 break;
             }
             // Empty entries and entries from earlier inputs are more than `i` behind and fail this range check.
+            // Comparing the stored bytes first rejects most candidates with one test.
+            if b.val[k] != x {
+                continue;
+            }
             let dist = here.wrapping_sub(b.pos[k]) as usize;
-            if dist == 0 || dist > i || dist > MAX_D as usize || b.val[k] != x {
+            if dist == 0 || dist > i || dist > MAX_D as usize {
                 continue;
             }
             let len = 4 + match_len(self.src, i - dist + 4, i + 4);

@@ -240,9 +240,10 @@ fn measure_ours(
     let enc = time(runs, || {
         std::hint::black_box(encode_all());
     });
+    let mut decoder = lzfse::Decoder::new();
     let dec = time(runs, || {
         for p in &packed {
-            std::hint::black_box(lzfse::decode_into(p, &mut out).unwrap());
+            std::hint::black_box(decoder.decode_into(p, &mut out).unwrap());
         }
     });
     Row {

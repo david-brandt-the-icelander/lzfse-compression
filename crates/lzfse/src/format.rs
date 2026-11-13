@@ -50,8 +50,49 @@ pub const D_BASE: [u32; D_SYMBOLS] = [
 ];
 
 // Return the symbol whose base is the largest one not above the value.
+#[cfg(test)]
 pub fn symbol_for(value: u32, base: &[u32]) -> usize {
     base.partition_point(|&b| b <= value) - 1
+}
+
+// Build a value-to-symbol lookup table for values 0..N from a base table, at compile time.
+const fn symbol_table<const N: usize>(base: &[u32]) -> [u8; N] {
+    let mut t = [0u8; N];
+    let (mut v, mut sym) = (0usize, 0usize);
+    while v < N {
+        while sym + 1 < base.len() && base[sym + 1] as usize <= v {
+            sym += 1;
+        }
+        t[v] = sym as u8;
+        v += 1;
+    }
+    t
+}
+
+static L_SYMBOL: [u8; MAX_L as usize + 1] = symbol_table(&L_BASE);
+static M_SYMBOL: [u8; MAX_M as usize + 1] = symbol_table(&M_BASE);
+
+// Symbol for a literal length (at most MAX_L).
+#[inline(always)]
+pub fn l_symbol(v: u32) -> usize {
+    L_SYMBOL[v as usize] as usize
+}
+
+// Symbol for a match length (at most MAX_M).
+#[inline(always)]
+pub fn m_symbol(v: u32) -> usize {
+    M_SYMBOL[v as usize] as usize
+}
+
+// Symbol for a distance code (at most MAX_D): groups of 4 symbols share an extra-bit count k, with bases
+// 2^(k+2) - 4 + j * 2^k.
+#[inline(always)]
+pub fn d_symbol(v: u32) -> usize {
+    if v < 4 {
+        return v as usize;
+    }
+    let k = (31 - (v + 4).leading_zeros()) - 2;
+    (4 * k + ((v + 4 - (1 << (k + 2))) >> k)) as usize
 }
 
 // Read a little-endian u32 at an offset, or report truncation.
@@ -343,6 +384,20 @@ pub fn write_v1(h: &BlockHeader, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The fast symbol lookups agree with the base-table search for every value.
+    #[test]
+    fn fast_symbols_match_search() {
+        for v in 0..=MAX_L {
+            assert_eq!(l_symbol(v), symbol_for(v, &L_BASE));
+        }
+        for v in 0..=MAX_M {
+            assert_eq!(m_symbol(v), symbol_for(v, &M_BASE));
+        }
+        for v in 0..=MAX_D {
+            assert_eq!(d_symbol(v), symbol_for(v, &D_BASE), "{v}");
+        }
+    }
 
     // Every frequency value round-trips through the variable-length code.
     #[test]
