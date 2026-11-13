@@ -142,8 +142,27 @@ pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
 #[inline(always)]
 #[allow(unsafe_code)]
 pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
-    if d < 8 || d > pos || pos + m + 15 > out.len() {
+    if d == 0 || d > pos || pos + m + 15 > out.len() {
         copy_match_cold(out, pos, d, m);
+        return;
+    }
+    if d < 8 {
+        // Write the first 8 bytes one by one (the pattern repeats every `d`), then copy 8 bytes per step from `p`
+        // back, where `p` is the smallest multiple of `d` that is at least 8, so source and destination never
+        // overlap.
+        for i in 0..8 {
+            out[pos + i] = out[pos + i - d];
+        }
+        let p = d * 8usize.div_ceil(d);
+        let dst = out[pos..].as_mut_ptr();
+        let mut c = 8;
+        while c < m {
+            // SAFETY: the destination ends at `pos + c + 8 <= pos + m + 15 <= out.len()`. Since `8 <= p < 8 + d`
+            // and `c >= 8`, the source starts after `pos - d >= 0` and ends at or before the destination's start,
+            // so both ranges are in bounds, they do not overlap, and the source bytes are already written.
+            unsafe { copy8(dst.add(c).sub(p), dst.add(c)) };
+            c += 8;
+        }
         return;
     }
     let dst = out[pos..].as_mut_ptr();
