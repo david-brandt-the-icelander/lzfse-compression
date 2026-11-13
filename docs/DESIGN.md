@@ -206,6 +206,17 @@ Measured on a 4 MiB session-log-like input (`tests/apple.rs`, `session_like`):
 On real binaries, libraries, man pages, JSON and source, the change was 0.2–3% smaller with both tables, never
 larger.
 
+**64 KiB fast path** (`encode/small.rs`). Inputs of at most 64 KiB, which covers every APFS chunk and most files,
+use their own finder:
+- **16-bit positions:** the short table is 192 KiB and the long table 32 KiB, against 512 + 256 KiB for large inputs.
+- **Cleared on each call**, so no stale-entry checks are needed.
+- **No distance-limit check:** a distance can never exceed 262,139 bytes.
+- **Sized to the input:** the tables shrink to 1/8 of that for 8 KiB and below. Each size is a separate
+  compile-time variant, because variable hash shifts cost about 8%.
+
+At 64 KiB chunks on real files it encodes 30–45% faster than the general finder, at most 0.2% larger. On 6 KB and
+20 KB inputs it is 30–50% faster.
+
 ### 4.3 Safety boundary
 
 - **Safe reference path:** the library's portable path is safe Rust. The crate root uses `#![deny(unsafe_code)]`; the only exceptions are the copy kernels in `kernels`, which check their bounds once and are tested against safe references.

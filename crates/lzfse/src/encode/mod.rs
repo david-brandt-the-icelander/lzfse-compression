@@ -1,5 +1,6 @@
 // LZFSE stream encoder: chooses the block type, finds matches and hands tokens to the block writer.
 mod block;
+mod small;
 
 use alloc::vec::Vec;
 
@@ -7,6 +8,7 @@ use crate::format::*;
 use crate::kernels::{load4, load8, match_len, match_len_back};
 use crate::lzvn;
 use block::Blocks;
+use small::{SmallBucket, SMALL_MAX};
 
 #[cfg(test)]
 pub(crate) use block::to_v1;
@@ -80,6 +82,9 @@ pub struct Encoder {
     base: u32,
     blocks: Blocks,
     lzvn_table: Vec<u32>,
+    // Tables of the 64 KiB fast path (16-bit positions, cleared per input).
+    small: Vec<SmallBucket>,
+    small_long: Vec<u16>,
 }
 
 impl Encoder {
@@ -97,6 +102,8 @@ impl Encoder {
             base: 1,
             blocks: Blocks::new(),
             lzvn_table: Vec::new(),
+            small: Vec::new(),
+            small_long: Vec::new(),
         }
     }
 
@@ -148,8 +155,20 @@ impl Encoder {
 
     // Tokenise one segment and append its blocks to `out`.
     fn encode_segment(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        let bits = self.prepare(src.len());
         let opts = self.opts;
+        self.blocks.reset();
+        if src.len() <= SMALL_MAX {
+            small::encode(
+                src,
+                &mut self.small,
+                &mut self.small_long,
+                &mut self.blocks,
+                &opts,
+                out,
+            );
+            return;
+        }
+        let bits = self.prepare(src.len());
         let mut f = Finder {
             src,
             table: &mut self.table,
@@ -159,49 +178,61 @@ impl Encoder {
             good: opts.good_match,
             base: self.base,
         };
-        let blocks = &mut self.blocks;
-        blocks.reset();
-        let limit = src.len().saturating_sub(8);
-        let (mut i, mut lit, mut d_prev, mut misses) = (0usize, 0usize, 0usize, 0usize);
-        while i < limit {
-            let Some(mut m) = f.find(i, lit, d_prev) else {
-                misses += 1;
-                i += if opts.skip_shift == 0 {
-                    1
-                } else {
-                    1 + (misses >> opts.skip_shift)
-                };
-                continue;
-            };
-            misses = 0;
-            if m.len < opts.lazy_below && i + 1 < limit {
-                if let Some(next) = f.find(i + 1, lit, d_prev) {
-                    if next.len > m.len {
-                        m = next;
-                    }
-                }
-            }
-            blocks.push(src, lit, m.start, m.len as u32, m.dist as u32, out);
-            d_prev = m.dist;
-            let end = m.start + m.len;
-            // Index positions inside the match so later data can refer to them; long matches only at their edges.
-            let mut j = (i + 2).max(m.start + 1);
-            while j < end.min(limit) {
-                f.insert(j, load4(src, j));
-                j += if m.len > 64 && j + 16 < end && j > m.start + 16 {
-                    end - 16 - j
-                } else {
-                    1
-                };
-            }
-            i = end;
-            lit = end;
-        }
-        blocks.push(src, lit, src.len(), 0, 0, out);
-        blocks.flush(src, out);
+        parse(src, &mut f, &mut self.blocks, &opts, out);
         // The next input's positions start past everything stored now, so none of these entries look valid then.
         self.base += src.len() as u32 + 1;
     }
+}
+
+// A match finder: the best match at a position, and indexing of positions skipped over by matches.
+trait Find {
+    // Find the best match at `i` (not starting before `lit`), checking the previous distance too, and index `i`.
+    fn find(&mut self, i: usize, lit: usize, d_prev: usize) -> Option<Match>;
+    // Index position `i` without searching.
+    fn insert(&mut self, i: usize);
+}
+
+// Tokenise `src` with match finder `f` (greedy with one-step lazy evaluation) and write its blocks to `out`.
+#[inline(always)]
+fn parse<F: Find>(src: &[u8], f: &mut F, blocks: &mut Blocks, opts: &Options, out: &mut Vec<u8>) {
+    let limit = src.len().saturating_sub(8);
+    let (mut i, mut lit, mut d_prev, mut misses) = (0usize, 0usize, 0usize, 0usize);
+    while i < limit {
+        let Some(mut m) = f.find(i, lit, d_prev) else {
+            misses += 1;
+            i += if opts.skip_shift == 0 {
+                1
+            } else {
+                1 + (misses >> opts.skip_shift)
+            };
+            continue;
+        };
+        misses = 0;
+        if m.len < opts.lazy_below && i + 1 < limit {
+            if let Some(next) = f.find(i + 1, lit, d_prev) {
+                if next.len > m.len {
+                    m = next;
+                }
+            }
+        }
+        blocks.push(src, lit, m.start, m.len as u32, m.dist as u32, out);
+        d_prev = m.dist;
+        let end = m.start + m.len;
+        // Index positions inside the match so later data can refer to them; long matches only at their edges.
+        let mut j = (i + 2).max(m.start + 1);
+        while j < end.min(limit) {
+            f.insert(j);
+            j += if m.len > 64 && j + 16 < end && j > m.start + 16 {
+                end - 16 - j
+            } else {
+                1
+            };
+        }
+        i = end;
+        lit = end;
+    }
+    blocks.push(src, lit, src.len(), 0, 0, out);
+    blocks.flush(src, out);
 }
 
 // One hash bucket: the most recent stored positions (base + position) and the 4 bytes found there.
@@ -243,14 +274,6 @@ impl Finder<'_> {
         (y.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.lshift) as usize
     }
 
-    // Record position `i` (whose 4 bytes are `x`) in both tables.
-    #[inline(always)]
-    fn insert(&mut self, i: usize, x: u32) {
-        self.insert_short(i, x);
-        let lh = self.lhash(load8(self.src, i));
-        self.long[lh] = self.base + i as u32;
-    }
-
     // Record position `i` in its bucket of the 4-byte table, evicting the oldest entry.
     #[inline(always)]
     fn insert_short(&mut self, i: usize, x: u32) {
@@ -258,6 +281,17 @@ impl Finder<'_> {
         let b = &mut self.table[h];
         b.pos = [self.base + i as u32, b.pos[0], b.pos[1], b.pos[2]];
         b.val = [x, b.val[0], b.val[1], b.val[2]];
+    }
+}
+
+impl Find for Finder<'_> {
+    // Record position `i` in both tables.
+    #[inline(always)]
+    fn insert(&mut self, i: usize) {
+        let y = load8(self.src, i);
+        self.insert_short(i, y as u32);
+        let lh = self.lhash(y);
+        self.long[lh] = self.base + i as u32;
     }
 
     // Find the best match at `i` (not starting before `lit`) among the previous distance, the long table and the
@@ -332,6 +366,25 @@ impl Finder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The 64 KiB fast path round-trips at each table-size boundary and on both sides of SMALL_MAX, and finds matches
+    // that reach from the last 16-bit positions back to the first ones.
+    #[test]
+    fn small_path_boundaries() {
+        for n in [
+            4096usize, 8192, 8193, 16384, 16385, 32768, 32769, 65535, 65536, 65537,
+        ] {
+            let mut data: Vec<u8> = (0..n as u32)
+                .map(|j| (j.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            let q = n / 4;
+            let head = data[..q].to_vec();
+            data[n - q..].copy_from_slice(&head);
+            let packed = encode(&data);
+            assert_eq!(crate::decode(&packed, n).unwrap(), data, "size {n}");
+            assert!(packed.len() < n - q + n / 16, "size {n}: far repeat missed");
+        }
+    }
 
     // One encoder reused across many inputs gives the same streams as fresh encoders.
     #[test]
