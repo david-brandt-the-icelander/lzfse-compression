@@ -3,7 +3,6 @@
 // Each used symbol owns a contiguous range of `f` decoder states, laid out in symbol order. With `N` states in
 // total, `k` is chosen so that N <= f * 2^k < 2N. The first `j0 = 2N / 2^k - f` states of a symbol's range read
 // `k` bits and the rest read `k - 1`; the next state is a per-state base plus the bits read.
-use alloc::vec::Vec;
 
 use crate::bits::{BitReader, BitWriter};
 use crate::Error;
@@ -14,7 +13,8 @@ fn shift_for(f: u32, n: u32) -> u32 {
     f.leading_zeros() - n.leading_zeros()
 }
 
-// Scale symbol counts to frequencies summing to exactly `n`, keeping every used symbol at least 1.
+// Scale symbol counts (at most 256 symbols, as in every LZFSE alphabet) to frequencies summing to exactly `n`,
+// keeping every used symbol at least 1.
 pub fn normalize(counts: &[u32], n: u32, out: &mut [u16]) {
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     out.iter_mut().for_each(|f| *f = 0);
@@ -23,7 +23,9 @@ pub fn normalize(counts: &[u32], n: u32, out: &mut [u16]) {
     }
     // Largest-remainder rounding: floor every share, then hand the leftover states to the biggest remainders.
     let mut assigned = 0u32;
-    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(counts.len());
+    // At most 256 symbols, so the remainders live on the stack.
+    let mut store = [(0u64, 0usize); 256];
+    let mut used = 0;
     for (i, &c) in counts.iter().enumerate() {
         if c == 0 {
             continue;
@@ -32,13 +34,15 @@ pub fn normalize(counts: &[u32], n: u32, out: &mut [u16]) {
         let floor = ((scaled / total) as u32).max(1);
         out[i] = floor as u16;
         assigned += floor;
-        remainders.push((scaled % total, i));
+        store[used] = (scaled % total, i);
+        used += 1;
     }
+    let remainders = &mut store[..used];
     if assigned < n {
         remainders.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let mut left = n - assigned;
         while left > 0 {
-            for &(_, i) in &remainders {
+            for &(_, i) in remainders.iter() {
                 if left == 0 {
                     break;
                 }
@@ -72,13 +76,12 @@ pub struct EncEntry {
 }
 
 // Build the encoder entries for frequencies summing to `n`.
-pub fn encoder_table(freq: &[u16], n: u32) -> Vec<EncEntry> {
-    let mut table = Vec::with_capacity(freq.len());
+pub fn encoder_table(freq: &[u16], n: u32, table: &mut [EncEntry]) {
     let mut offset = 0u32;
-    for &f in freq {
+    for (&f, slot) in freq.iter().zip(table.iter_mut()) {
         let f = f as u32;
         if f == 0 {
-            table.push(EncEntry::default());
+            *slot = EncEntry::default();
             continue;
         }
         let k = shift_for(f, n);
@@ -91,15 +94,14 @@ pub fn encoder_table(freq: &[u16], n: u32) -> Vec<EncEntry> {
         } else {
             (offset + (n >> (k - 1))) as i32 - f as i32
         };
-        table.push(EncEntry {
+        *slot = EncEntry {
             s0,
             k,
             delta_hi,
             delta_lo,
-        });
+        };
         offset += f;
     }
-    table
 }
 
 // Encode `symbol` from `state`, writing the low bits of the state and moving to the symbol's decoder state.
@@ -163,9 +165,8 @@ fn for_each_state(
 }
 
 // Build the literal decoder table; unused states decode to symbol 0 and stay in state 0.
-pub fn literal_table(freq: &[u16], n: u32, table: &mut Vec<LitEntry>) -> Result<(), Error> {
-    table.clear();
-    table.resize(n as usize, LitEntry::default());
+pub fn literal_table(freq: &[u16], n: u32, table: &mut [LitEntry]) -> Result<(), Error> {
+    table.fill(LitEntry::default());
     for_each_state(freq, n, |i, sym, k, base| {
         table[i] = LitEntry {
             k: k as u8,
@@ -181,10 +182,9 @@ pub fn value_table(
     n: u32,
     extra: &[u8],
     vbase: &[u32],
-    table: &mut Vec<ValueEntry>,
+    table: &mut [ValueEntry],
 ) -> Result<(), Error> {
-    table.clear();
-    table.resize(n as usize, ValueEntry::default());
+    table.fill(ValueEntry::default());
     for_each_state(freq, n, |i, sym, k, base| {
         table[i] = ValueEntry {
             total_bits: k as u8 + extra[sym],
@@ -223,6 +223,7 @@ pub fn decode_value<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     // Normalised frequencies always sum to the state count and keep used symbols alive.
     #[test]
@@ -231,7 +232,7 @@ mod tests {
             &[1],
             &[1, 0, 0, 1_000_000],
             &[5; 256],
-            &[1; 300],
+            &[1; 256],
             &[0, 0, 0],
             &[
                 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 90000,
@@ -268,7 +269,8 @@ mod tests {
             data.iter().for_each(|&b| counts[b as usize] += 1);
             let mut freq = alloc::vec![0u16; symbols];
             normalize(&counts, n, &mut freq);
-            let enc = encoder_table(&freq, n);
+            let mut enc = [EncEntry::default(); 256];
+            encoder_table(&freq, n, &mut enc);
             let mut w = BitWriter::new();
             let mut out = alloc::vec![0u8; 8];
             let mut state = 0u32;
@@ -277,10 +279,9 @@ mod tests {
                 w.flush(&mut out);
             }
             let bits = w.finish(&mut out);
-            let mut table = Vec::new();
-            literal_table(&freq, n, &mut table).unwrap();
-            table.resize(1024, LitEntry::default());
-            let fixed: &[LitEntry; 1024] = table.as_slice().try_into().unwrap();
+            let mut fixed = [LitEntry::default(); 1024];
+            literal_table(&freq, n, &mut fixed).unwrap();
+            let fixed = &fixed;
             let mut r = BitReader::new(&out, bits).unwrap();
             for &b in &data {
                 r.refill().unwrap();
@@ -295,7 +296,8 @@ mod tests {
     fn single_symbol_uses_no_bits() {
         let mut freq = [0u16; 4];
         freq[2] = 64;
-        let enc = encoder_table(&freq, 64);
+        let mut enc = [EncEntry::default(); 4];
+        encoder_table(&freq, 64, &mut enc);
         let mut w = BitWriter::new();
         let mut state = 0u32;
         for _ in 0..100 {
@@ -309,8 +311,14 @@ mod tests {
     // Frequencies that add up to more than the state count are rejected.
     #[test]
     fn oversized_tables_are_rejected() {
-        let mut t = Vec::new();
-        assert!(literal_table(&[1000, 25], 1024, &mut t).is_err());
-        assert!(value_table(&[60, 5], 64, &[0, 0], &[0, 1], &mut Vec::new()).is_err());
+        assert!(literal_table(&[1000, 25], 1024, &mut [LitEntry::default(); 1024]).is_err());
+        assert!(value_table(
+            &[60, 5],
+            64,
+            &[0, 0],
+            &[0, 1],
+            &mut [ValueEntry::default(); 64]
+        )
+        .is_err());
     }
 }

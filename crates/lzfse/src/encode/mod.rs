@@ -73,6 +73,7 @@ pub struct Encoder {
     // Added to positions before they are stored, so entries from earlier inputs are recognisably stale.
     base: u32,
     blocks: Blocks,
+    lzvn_table: Vec<u32>,
 }
 
 impl Encoder {
@@ -83,6 +84,7 @@ impl Encoder {
             table: Vec::new(),
             base: 1,
             blocks: Blocks::new(),
+            lzvn_table: Vec::new(),
         }
     }
 
@@ -93,7 +95,7 @@ impl Encoder {
         } else if src.len() < LZVN_THRESHOLD {
             let mark = out.len();
             out.extend_from_slice(&[0; LZVN_HEADER_SIZE]);
-            lzvn::encode(src, out);
+            lzvn::encode_with_table(src, out, &mut self.lzvn_table);
             let payload = out.len() - mark - LZVN_HEADER_SIZE;
             if payload < src.len() {
                 out[mark..mark + 4].copy_from_slice(&MAGIC_LZVN.to_le_bytes());
@@ -113,23 +115,31 @@ impl Encoder {
 
     // Make the table ready for an input of `len` bytes: allocate it once, and clear it only when the position
     // base would overflow.
-    fn prepare(&mut self, len: usize) {
-        let size = 1usize << self.opts.hash_bits;
-        if self.table.len() != size || self.base as u64 + len as u64 + 2 > u32::MAX as u64 {
+    // Returns the hash bits to use: inputs smaller than the table would fill use a smaller part of it.
+    fn prepare(&mut self, len: usize) -> u32 {
+        let fit = (usize::BITS - len.leading_zeros())
+            .saturating_sub(2)
+            .max(10);
+        let bits = self.opts.hash_bits.min(fit);
+        // Grow (never shrink) the table; stale entries are rejected by the position base, so no clearing is needed
+        // unless the base would overflow.
+        if self.table.len() < 1 << bits || self.base as u64 + len as u64 + 2 > u32::MAX as u64 {
+            let size = (1usize << bits).max(self.table.len());
             self.table.clear();
             self.table.resize(size, Bucket::default());
             self.base = 1;
         }
+        bits
     }
 
     // Tokenise one segment and append its blocks to `out`.
     fn encode_segment(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        self.prepare(src.len());
+        let bits = self.prepare(src.len());
         let opts = self.opts;
         let mut f = Finder {
             src,
             table: &mut self.table,
-            shift: 32 - opts.hash_bits,
+            shift: 32 - bits,
             good: opts.good_match,
             base: self.base,
         };

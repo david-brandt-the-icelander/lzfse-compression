@@ -312,24 +312,31 @@ fn put(value: u32, at: u32, width: u32) -> u64 {
     (value as u64) << at
 }
 
-// Append a v2 header for `h` to `out`.
+// Append a v2 header for `h` to `out`, without allocating: the frequency tables are written in place after a
+// placeholder for the fixed fields, which are filled in once the header size is known.
 pub fn write_v2(h: &BlockHeader, out: &mut Vec<u8>) {
-    let mut tables = Vec::with_capacity(720);
+    let start = out.len();
+    out.extend_from_slice(&[0u8; V2_FIXED_SIZE]);
     let (mut accum, mut nbits) = (0u32, 0u32);
     for f in h.freqs() {
         let (bits, n) = write_freq(f);
         accum |= bits << nbits;
         nbits += n;
         while nbits >= 8 {
-            tables.push(accum as u8);
+            out.push(accum as u8);
             accum >>= 8;
             nbits -= 8;
         }
     }
     if nbits > 0 {
-        tables.push(accum as u8);
+        out.push(accum as u8);
     }
-    let size = (V2_FIXED_SIZE + tables.len()) as u32;
+    let size = (out.len() - start) as u32;
+    out[start..start + V2_FIXED_SIZE].copy_from_slice(&v2_fixed(h, size));
+}
+
+// The first 32 bytes of a v2 header (magic, raw size and the packed fields) for a header of `size` bytes.
+pub fn v2_fixed(h: &BlockHeader, size: u32) -> [u8; V2_FIXED_SIZE] {
     let w0 = put(h.n_literals, 0, 20)
         | put(h.n_lit_payload, 20, 20)
         | put(h.n_matches, 40, 20)
@@ -344,12 +351,13 @@ pub fn write_v2(h: &BlockHeader, out: &mut Vec<u8>) {
         | put(h.l_state as u32, 32, 10)
         | put(h.m_state as u32, 42, 10)
         | put(h.d_state as u32, 52, 10);
-    out.extend_from_slice(&MAGIC_V2.to_le_bytes());
-    out.extend_from_slice(&h.n_raw.to_le_bytes());
-    for w in [w0, w1, w2] {
-        out.extend_from_slice(&w.to_le_bytes());
+    let mut b = [0u8; V2_FIXED_SIZE];
+    b[..4].copy_from_slice(&MAGIC_V2.to_le_bytes());
+    b[4..8].copy_from_slice(&h.n_raw.to_le_bytes());
+    for (i, w) in [w0, w1, w2].iter().enumerate() {
+        b[8 + 8 * i..16 + 8 * i].copy_from_slice(&w.to_le_bytes());
     }
-    out.extend_from_slice(&tables);
+    b
 }
 
 // Append a v1 header for `h` to `out` (Apple's encoder never writes v1; we use it to test the decoder).

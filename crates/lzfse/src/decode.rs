@@ -11,7 +11,7 @@ use crate::{lzvn, Error};
 /// A reusable decoder: its tables and literal buffer carry over between calls, which helps when decoding many
 /// small streams (such as 64 KiB chunks).
 pub struct Decoder {
-    s: Scratch,
+    s: alloc::boxed::Box<Scratch>,
 }
 
 impl Default for Decoder {
@@ -24,7 +24,9 @@ impl Default for Decoder {
 impl Decoder {
     /// Create a decoder; buffers are allocated on first use.
     pub fn new() -> Self {
-        Decoder { s: Scratch::new() }
+        Decoder {
+            s: alloc::boxed::Box::new(Scratch::new()),
+        }
     }
 
     /// Decode a stream into `dst` and return the number of bytes written. Bytes of `dst` past that length may
@@ -36,21 +38,22 @@ impl Decoder {
 
 // Reusable per-block decoding tables and literal buffer.
 struct Scratch {
-    lit: Vec<LitEntry>,
-    l: Vec<ValueEntry>,
-    m: Vec<ValueEntry>,
-    d: Vec<ValueEntry>,
+    lit: [LitEntry; LIT_STATES as usize],
+    l: [ValueEntry; L_STATES as usize],
+    m: [ValueEntry; M_STATES as usize],
+    d: [ValueEntry; D_STATES as usize],
+    // Grows to the largest block seen (at most 40,000 literals plus slack) and is then reused.
     literals: Vec<u8>,
 }
 
 impl Scratch {
-    // Allocate empty tables; they grow on first use.
+    // Tables are fixed-size arrays (about 7 KB); only the literal buffer is allocated, on first use.
     fn new() -> Self {
         Scratch {
-            lit: Vec::new(),
-            l: Vec::new(),
-            m: Vec::new(),
-            d: Vec::new(),
+            lit: [LitEntry::default(); LIT_STATES as usize],
+            l: [ValueEntry::default(); L_STATES as usize],
+            m: [ValueEntry::default(); M_STATES as usize],
+            d: [ValueEntry::default(); D_STATES as usize],
             literals: Vec::new(),
         }
     }
@@ -186,8 +189,7 @@ fn decode_literals(h: &BlockHeader, src: &[u8], s: &mut Scratch) -> Result<(), E
         s.literals.resize(count + SLACK, 0);
     }
     let mut r = BitReader::new(src, h.literal_bits)?;
-    let table: &[LitEntry; LIT_STATES as usize] =
-        s.lit.as_slice().try_into().map_err(|_| Error::Corrupt)?;
+    let table = &s.lit;
     let [mut s0, mut s1, mut s2, mut s3] = h.literal_state.map(|v| v as u32);
     for group in s.literals[..count].chunks_exact_mut(4) {
         r.refill()?;
@@ -211,12 +213,7 @@ fn decode_tokens(
     fse::value_table(&h.l_freq, L_STATES, &L_EXTRA, &L_BASE, &mut s.l)?;
     fse::value_table(&h.m_freq, M_STATES, &M_EXTRA, &M_BASE, &mut s.m)?;
     fse::value_table(&h.d_freq, D_STATES, &D_EXTRA, &D_BASE, &mut s.d)?;
-    let lt: &[ValueEntry; L_STATES as usize] =
-        s.l.as_slice().try_into().map_err(|_| Error::Corrupt)?;
-    let mt: &[ValueEntry; M_STATES as usize] =
-        s.m.as_slice().try_into().map_err(|_| Error::Corrupt)?;
-    let dt: &[ValueEntry; D_STATES as usize] =
-        s.d.as_slice().try_into().map_err(|_| Error::Corrupt)?;
+    let (lt, mt, dt) = (&s.l, &s.m, &s.d);
     let mut r = BitReader::new(lmd, h.lmd_bits)?;
     let (mut ls, mut ms, mut ds) = (h.l_state as u32, h.m_state as u32, h.d_state as u32);
     let mut lit = 0usize;

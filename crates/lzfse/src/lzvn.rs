@@ -1,5 +1,4 @@
 // LZVN: Apple's byte-oriented LZ77 format, used for small LZFSE blocks and decmpfs types 7/8.
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::kernels::{copy_match, load4, match_len, match_len_back};
@@ -7,7 +6,7 @@ use crate::Error;
 
 const EOS: u8 = 0x06;
 const MAX_DISTANCE: usize = 0xFFFF;
-const HASH_BITS: u32 = 14;
+const MAX_HASH_BITS: u32 = 14;
 // Distance placeholder meaning "reuse the previous distance".
 const PREV: usize = usize::MAX;
 
@@ -201,18 +200,29 @@ fn emit_token(out: &mut Vec<u8>, lits: &[u8], m: usize, d: usize, d_prev: usize)
 
 // Hash 4 bytes into a table index.
 #[inline(always)]
-fn hash(x: u32) -> usize {
-    (x.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)) as usize
+fn hash(x: u32, shift: u32) -> usize {
+    (x.wrapping_mul(0x9E37_79B1) >> shift) as usize
 }
 
 /// Compress `src` as an LZVN payload (ending with the end-of-stream opcode) appended to `out`.
 pub fn encode(src: &[u8], out: &mut Vec<u8>) {
+    encode_with_table(src, out, &mut Vec::new());
+}
+
+// Encode with a caller-owned hash table, which is resized to suit the input (at most 64 KiB) and cleared.
+pub(crate) fn encode_with_table(src: &[u8], out: &mut Vec<u8>, table: &mut Vec<u32>) {
+    // Small inputs get small tables: about one bucket per 4 input bytes, between 2^8 and 2^14.
+    let bits = (usize::BITS - src.len().leading_zeros())
+        .saturating_sub(2)
+        .clamp(8, MAX_HASH_BITS);
+    let shift = 32 - bits;
+    table.clear();
+    table.resize(1 << bits, 0);
     let n = src.len();
-    let mut table = vec![0u32; 1 << HASH_BITS];
     let (mut i, mut lit, mut d_prev) = (0usize, 0usize, 0usize);
     while i + 4 <= n {
         let x = load4(src, i);
-        let h = hash(x);
+        let h = hash(x, shift);
         let cand = table[h] as usize;
         table[h] = (i + 1) as u32;
         let (mut best_len, mut best_d) = (0usize, 0usize);
@@ -245,7 +255,7 @@ pub fn encode(src: &[u8], out: &mut Vec<u8>) {
         let end = start + m;
         let mut j = i + 1;
         while j + 4 <= n && j < end {
-            table[hash(load4(src, j))] = (j + 1) as u32;
+            table[hash(load4(src, j), shift)] = (j + 1) as u32;
             j += 1;
         }
         i = end;
@@ -258,6 +268,7 @@ pub fn encode(src: &[u8], out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     // Round-trip a buffer through the encoder and decoder.
     fn round_trip(data: &[u8]) -> Vec<u8> {

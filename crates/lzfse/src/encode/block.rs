@@ -1,10 +1,9 @@
 // Collects L/M/D tokens and literals into LZFSE blocks and entropy-codes each block as `bvx2` (or `bvx-`).
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::bits::BitWriter;
 use crate::format::*;
-use crate::fse;
+use crate::fse::{self, EncEntry};
 
 // Spare bytes after the literal buffer so wide copies and padding never run out of room.
 const LIT_SLACK: usize = 32;
@@ -20,29 +19,35 @@ pub struct Blocks {
     lits: Vec<u8>,
     n_lits: usize,
     syms: Vec<[u8; 3]>,
-    header: Vec<u8>,
 }
 
 impl Blocks {
-    // Allocate buffers sized for a full block.
+    // Create empty buffers; `reset` allocates them the first time an LZFSE block is actually built.
     pub fn new() -> Self {
         Blocks {
             block_start: 0,
             raw: 0,
-            l: Vec::with_capacity(MATCHES_PER_BLOCK),
-            m: Vec::with_capacity(MATCHES_PER_BLOCK),
-            d: Vec::with_capacity(MATCHES_PER_BLOCK),
-            lits: vec![0; LITERALS_PER_BLOCK + LIT_SLACK],
+            l: Vec::new(),
+            m: Vec::new(),
+            d: Vec::new(),
+            lits: Vec::new(),
             n_lits: 0,
-            syms: Vec::with_capacity(MATCHES_PER_BLOCK),
-            header: Vec::with_capacity(V2_FIXED_SIZE + 720),
+            syms: Vec::new(),
         }
     }
 
-    // Start a new input whose first block begins at offset 0 of its source.
+    // Start a new input whose first block begins at offset 0 of its source, sizing the buffers for a full block
+    // (only the first call allocates).
     pub fn reset(&mut self) {
         self.block_start = 0;
         self.clear();
+        self.l.reserve(MATCHES_PER_BLOCK);
+        self.m.reserve(MATCHES_PER_BLOCK);
+        self.d.reserve(MATCHES_PER_BLOCK);
+        self.syms.reserve(MATCHES_PER_BLOCK);
+        if self.lits.len() < LITERALS_PER_BLOCK + LIT_SLACK {
+            self.lits.resize(LITERALS_PER_BLOCK + LIT_SLACK, 0);
+        }
     }
 
     // Drop the buffered tokens.
@@ -51,6 +56,7 @@ impl Blocks {
         self.l.clear();
         self.m.clear();
         self.d.clear();
+        self.syms.clear();
         self.n_lits = 0;
     }
 
@@ -150,16 +156,20 @@ impl Blocks {
         fse::normalize(&l_c, L_STATES, &mut h.l_freq);
         fse::normalize(&m_c, M_STATES, &mut h.m_freq);
         fse::normalize(&d_c, D_STATES, &mut h.d_freq);
-        let lit_enc = fse::encoder_table(&h.lit_freq, LIT_STATES);
-        let l_enc = fse::encoder_table(&h.l_freq, L_STATES);
-        let m_enc = fse::encoder_table(&h.m_freq, M_STATES);
-        let d_enc = fse::encoder_table(&h.d_freq, D_STATES);
+        // Encoder tables are small fixed arrays on the stack.
+        let mut lit_enc = [EncEntry::default(); LIT_SYMBOLS];
+        let mut l_enc = [EncEntry::default(); L_SYMBOLS];
+        let mut m_enc = [EncEntry::default(); M_SYMBOLS];
+        let mut d_enc = [EncEntry::default(); D_SYMBOLS];
+        fse::encoder_table(&h.lit_freq, LIT_STATES, &mut lit_enc);
+        fse::encoder_table(&h.l_freq, L_STATES, &mut l_enc);
+        fse::encoder_table(&h.m_freq, M_STATES, &mut m_enc);
+        fse::encoder_table(&h.d_freq, D_STATES, &mut d_enc);
 
         // The header's size depends only on the frequency tables, so reserve it now and fill it in at the end.
-        self.header.clear();
-        write_v2(&h, &mut self.header);
         let header_at = out.len();
-        out.extend_from_slice(&self.header);
+        write_v2(&h, out);
+        let header_size = (out.len() - header_at) as u32;
 
         // Literals: four interleaved states, encoded last group first so the decoder reads forwards.
         let lit_at = out.len();
@@ -196,9 +206,8 @@ impl Blocks {
         h.m_state = ms as u16;
         h.d_state = ds as u16;
         h.n_lmd_payload = (out.len() - lmd_at) as u32;
-        self.header.clear();
-        write_v2(&h, &mut self.header);
-        out[header_at..header_at + self.header.len()].copy_from_slice(&self.header);
+        // Only the fixed fields change (final states and payload sizes); the tables written above stay.
+        out[header_at..header_at + V2_FIXED_SIZE].copy_from_slice(&v2_fixed(&h, header_size));
     }
 }
 
