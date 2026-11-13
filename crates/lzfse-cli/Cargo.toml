@@ -1,0 +1,16 @@
+[package]
+name = "lzfse-cli"
+description = "Command-line encoder, decoder and inspector for lzfse-zazzcat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "lzfse-zazzcat"
+path = "src/main.rs"
+
+[dependencies]
+lzfse-zazzcat = { path = "../lzfse" }

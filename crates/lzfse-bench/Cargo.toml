@@ -1,0 +1,12 @@
+[package]
+name = "lzfse-bench"
+description = "Benchmarks lzfse-zazzcat against Apple's libcompression"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+lzfse-zazzcat = { path = "../lzfse" }

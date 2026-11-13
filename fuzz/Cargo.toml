@@ -1,0 +1,39 @@
+[package]
+name = "lzfse-zazzcat-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lzfse-zazzcat = { path = "../crates/lzfse" }
+
+# Kept out of the main workspace so stable builds never need nightly.
+[workspace]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "round_trip"
+path = "fuzz_targets/round_trip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lzvn_decode"
+path = "fuzz_targets/lzvn_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decmpfs"
+path = "fuzz_targets/decmpfs.rs"
+test = false
+doc = false
