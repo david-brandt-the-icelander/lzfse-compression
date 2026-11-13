@@ -29,7 +29,10 @@ impl BitWriter {
     #[inline(always)]
     pub fn flush(&mut self, out: &mut Vec<u8>) {
         let bytes = (self.nbits / 8) as usize;
-        out.extend_from_slice(&self.accum.to_le_bytes()[..bytes]);
+        // Append all 8 bytes and cut back: a fixed-size store instead of a variable-length copy (a memcpy call).
+        let len = out.len();
+        out.extend_from_slice(&self.accum.to_le_bytes());
+        out.truncate(len + bytes);
         self.accum = if bytes == 8 {
             0
         } else {

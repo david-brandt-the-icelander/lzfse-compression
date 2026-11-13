@@ -88,17 +88,8 @@ impl Blocks {
         self.l.push(n as u32);
         self.m.push(m);
         self.d.push(d);
-        let at = self.n_lits;
-        if lit + n + 16 <= src.len() {
-            // 16-byte steps; the overshoot lands in the slack and is overwritten by the next literals.
-            let mut c = 0;
-            while c < n {
-                self.lits[at + c..at + c + 16].copy_from_slice(&src[lit + c..lit + c + 16]);
-                c += 16;
-            }
-        } else {
-            self.lits[at..at + n].copy_from_slice(&src[lit..lit + n]);
-        }
+        // Wide copy; any overshoot lands in the slack and is overwritten by the next literals.
+        crate::kernels::wild_copy(&mut self.lits, self.n_lits, src, lit, n);
         self.n_lits += n;
         self.raw += n + m as usize;
     }
