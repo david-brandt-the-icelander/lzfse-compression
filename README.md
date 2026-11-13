@@ -14,23 +14,25 @@ let unpacked = lzfse_zazzcat::decode(&packed, data.len())?;
 
 ## Why it is faster
 
-Measured against `libcompression` in the same process on GitHub's Apple Silicon runners. The full table and
-method are in [`docs/benchmarks`](docs/benchmarks/2026-11-13-github-m2pro.md).
+Measured against `libcompression` in the same process on the owner's M1 Pro (10 threads, on AC power). The full
+tables and method are in [`docs/benchmarks`](docs/benchmarks/2026-11-13-owner-m1-pro.md).
 
 - **Every core.** `encode_chunks` compresses independent chunks on all cores, which is how APFS stores files
-  (64 KiB chunks). The chunks are separate streams, so they decode in parallel too. Apple's API is single-threaded. On a 5-thread M2 Pro runner, text encodes
-  about 4× faster than Apple's and decodes about 3× faster.
+  (64 KiB chunks). The chunks are separate streams, so they decode in parallel too. Apple's API is
+  single-threaded. On a real Claude Code session log, we encode 7.4–9.9× faster than Apple's and decode about 5.8×
+  faster.
+- **Faster on real data even on one core.** On that same log, single-threaded encoding is 9–39% faster and
+  decoding is on par, at the same compression ratio (within 0.4%).
 - **Incompressible data is stored, not coded.** Blocks that do not shrink become raw blocks:
-  - media and already-compressed files decode at memory speed, about 40× faster than Apple's;
-  - they encode about 2× faster;
+  - media and already-compressed files decode 41–52× faster than Apple's;
+  - they encode about 2.2× faster;
   - and they end up 1% smaller.
 - **Cheap where Apple is expensive.**
-  - Long runs (zeros, padding) encode 25–50× faster.
-  - Literal-heavy data (JSON with base64 attachments) encodes about 2× faster and decodes at the same speed.
-- **Same ratio.** On every input, our output is within 0.3% of Apple's size.
+  - Long runs (zeros, padding) encode 28–52× faster.
+  - JSON with base64 attachments encodes about 2× faster and decodes 10% faster.
 
-Single-threaded encoding of plain text and binaries is 10–20% behind Apple's, and decoding them is 20–30% behind.
-Closing that gap is the current work (see [`docs/DESIGN.md`](docs/DESIGN.md), section 5).
+Single-threaded decoding of plain text (about 25% behind) and binaries (about 15% behind) is where Apple's decoder
+still wins. Closing that gap is the current work (see [`docs/DESIGN.md`](docs/DESIGN.md), section 5).
 
 ## What is in the box
 
