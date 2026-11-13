@@ -85,6 +85,15 @@ pub fn copy_match_cold(out: &mut [u8], pos: usize, d: usize, m: usize) {
     copy_match(out, pos, d, m);
 }
 
+// Tell whether a buffer of `len` bytes has room for wide copies of `n` bytes starting at `at`: each kernel's
+// first 16-byte step always runs, and later steps end at most 15 bytes past `at + n`.
+#[inline(always)]
+fn room(len: usize, at: usize, n: usize) -> bool {
+    at.checked_add(n)
+        .and_then(|e| e.checked_add(16))
+        .is_some_and(|e| e <= len)
+}
+
 // Copy 16 bytes from `s` to `d` with one unaligned load and store.
 // SAFETY (caller): both pointers are valid for 16 bytes.
 #[inline(always)]
@@ -118,7 +127,8 @@ unsafe fn copy8(s: *const u8, d: *mut u8) {
 #[inline(always)]
 #[allow(unsafe_code)]
 pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
-    if at + n + 15 > src.len() || pos + n + 15 > dst.len() {
+    // The first 16-byte step always runs (even for n = 0), so both buffers need `n + 16` bytes from the start.
+    if !room(src.len(), at, n) || !room(dst.len(), pos, n) {
         copy_exact(dst, pos, src, at, n);
         return;
     }
@@ -142,7 +152,7 @@ pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
 #[inline(always)]
 #[allow(unsafe_code)]
 pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
-    if d == 0 || d > pos || pos + m + 15 > out.len() {
+    if d == 0 || d > pos || !room(out.len(), pos, m) {
         copy_match_cold(out, pos, d, m);
         return;
     }
@@ -168,7 +178,7 @@ pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
         let dst = out[pos..].as_mut_ptr();
         let mut c = 8;
         while c < m {
-            // SAFETY: the destination ends at `pos + c + 8 <= pos + m + 15 <= out.len()`. Since `8 <= p < 8 + d`
+            // SAFETY: the destination ends at `pos + c + 8 <= pos + m + 15 < out.len()`. Since `8 <= p < 8 + d`
             // and `c >= 8`, the source starts after `pos - d >= 0` and ends at or before the destination's start,
             // so both ranges are in bounds, they do not overlap, and the source bytes are already written.
             unsafe { copy8(dst.add(c).sub(p), dst.add(c)) };
@@ -286,6 +296,42 @@ mod tests {
         let mut tight: alloc::vec::Vec<u8> = (0..30u8).collect();
         copy_match_wild(&mut tight, 20, 10, 10);
         assert_eq!(tight[20..], tight[10..20]);
+    }
+
+    // The room check counts the always-run first step: zero-length copies still need 16 bytes, and nothing
+    // overflows near usize::MAX.
+    #[test]
+    fn room_counts_the_first_step() {
+        assert!(room(16, 0, 0));
+        assert!(!room(15, 0, 0));
+        assert!(room(20, 4, 0));
+        assert!(!room(20, 5, 0));
+        assert!(room(40, 4, 20));
+        assert!(!room(39, 4, 20));
+        assert!(!room(usize::MAX, usize::MAX - 4, 3));
+    }
+
+    // Kernels on buffers with no spare room stay in bounds (exact fallbacks), including zero-length copies.
+    #[test]
+    fn tight_buffers_use_exact_copies() {
+        let src: alloc::vec::Vec<u8> = (0..40u8).collect();
+        for at in 0..40 {
+            for n in 0..(40 - at).min(20) {
+                let mut dst = alloc::vec![0u8; n];
+                wild_copy(&mut dst, 0, &src, at, n);
+                assert_eq!(dst[..], src[at..at + n]);
+            }
+        }
+        for d in 1..12 {
+            for m in 0..20 {
+                let mut out: alloc::vec::Vec<u8> =
+                    (0..12u8).chain(core::iter::repeat(0).take(m)).collect();
+                let mut want = out.clone();
+                copy_match_wild(&mut out, 12, d, m);
+                copy_match(&mut want, 12, d, m);
+                assert_eq!(out, want, "d={d} m={m}");
+            }
+        }
     }
 
     // The wide copies produce the same bytes as the exact ones inside the requested range.
