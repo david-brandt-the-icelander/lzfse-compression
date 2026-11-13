@@ -14,21 +14,21 @@ let unpacked = lzfse_zazzcat::decode(&packed, data.len())?;
 
 ## Why it is faster
 
-Measured against `libcompression` in the same process, on the owner's M1 Pro (10 threads, on battery). The full
+Measured against `libcompression` in the same process on the owner's M1 Pro (10 threads, on AC power). The full
 tables and method are in [`docs/benchmarks`](docs/benchmarks/2026-11-13-owner-m1-pro.md).
 
 - **Every core.** `encode_chunks` compresses independent chunks on all cores, which is how APFS stores files
   (64 KiB chunks). The chunks are separate streams, so they decode in parallel too. Apple's API is
-  single-threaded. On a real Claude Code session log, we encode 7.7–9.2× faster than Apple's and decode 5.4–6.3×
+  single-threaded. On a real Claude Code session log, we encode 7.4–9.9× faster than Apple's and decode about 5.8×
   faster.
-- **Faster on real data even on one core.** On that same log, single-threaded encoding is 10–40% faster and
+- **Faster on real data even on one core.** On that same log, single-threaded encoding is 9–39% faster and
   decoding is on par, at the same compression ratio (within 0.4%).
 - **Incompressible data is stored, not coded.** Blocks that do not shrink become raw blocks:
-  - media and already-compressed files decode 45–60× faster than Apple's;
-  - they encode about 2× faster;
+  - media and already-compressed files decode 41–52× faster than Apple's;
+  - they encode about 2.2× faster;
   - and they end up 1% smaller.
 - **Cheap where Apple is expensive.**
-  - Long runs (zeros, padding) encode 27–53× faster.
+  - Long runs (zeros, padding) encode 28–52× faster.
   - JSON with base64 attachments encodes about 2× faster and decodes 10% faster.
 
 Single-threaded decoding of plain text (about 25% behind) and binaries (about 15% behind) is where Apple's decoder
