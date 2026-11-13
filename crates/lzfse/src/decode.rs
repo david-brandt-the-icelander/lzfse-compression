@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::bits::BitReader;
 use crate::format::*;
 use crate::fse::{self, LitEntry, ValueEntry};
-use crate::kernels::{copy_match, copy_match_wild, wild_copy, SLACK};
+use crate::kernels::{copy_match_cold, copy_match_wild, wild_copy, SLACK};
 use crate::{lzvn, Error};
 
 /// A reusable decoder: its tables and literal buffer carry over between calls, which helps when decoding many
@@ -27,7 +27,8 @@ impl Decoder {
         Decoder { s: Scratch::new() }
     }
 
-    /// Decode a stream into `dst` and return the number of bytes written.
+    /// Decode a stream into `dst` and return the number of bytes written. Bytes of `dst` past that length may
+    /// be overwritten.
     pub fn decode_into(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
         decode_with(src, dst, &mut self.s)
     }
@@ -119,6 +120,9 @@ pub fn decode(src: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
 }
 
 /// Decode a stream into `dst` and return the number of bytes written.
+///
+/// Like Apple's decoder, this may overwrite bytes of `dst` past the returned length (it uses wide copies when
+/// there is room); their contents are unspecified.
 pub fn decode_into(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
     decode_with(src, dst, &mut Scratch::new())
 }
@@ -173,6 +177,7 @@ fn decode_with(src: &[u8], dst: &mut [u8], scratch: &mut Scratch) -> Result<usiz
 }
 
 // Build the literal table and decode the block's literals (a multiple of 4) into the scratch buffer.
+#[inline(never)]
 fn decode_literals(h: &BlockHeader, src: &[u8], s: &mut Scratch) -> Result<(), Error> {
     fse::literal_table(&h.lit_freq, LIT_STATES, &mut s.lit)?;
     let count = (h.n_literals as usize + 3) & !3;
@@ -195,6 +200,7 @@ fn decode_literals(h: &BlockHeader, src: &[u8], s: &mut Scratch) -> Result<(), E
 }
 
 // Decode the block's L, M, D tokens and execute them into `dst` from `pos`; return the new output position.
+#[inline(never)]
 fn decode_tokens(
     h: &BlockHeader,
     lmd: &[u8],
@@ -235,14 +241,28 @@ fn decode_tokens(
             wild_copy(dst, pos, &s.literals, lit, l);
             copy_match_wild(dst, pos + l, d, m);
         } else {
-            if pos + l + m > dst.len() {
-                return Err(Error::OutputTooSmall);
-            }
-            dst[pos..pos + l].copy_from_slice(&s.literals[lit..lit + l]);
-            copy_match(dst, pos + l, d, m);
+            token_near_end(dst, pos, &s.literals[lit..lit + l], d, m)?;
         }
         lit += l;
         pos += l + m;
     }
     Ok(pos)
+}
+
+// Execute one token with exact copies near the end of the output (out of line: it is rarely taken).
+#[cold]
+#[inline(never)]
+fn token_near_end(
+    dst: &mut [u8],
+    pos: usize,
+    lits: &[u8],
+    d: usize,
+    m: usize,
+) -> Result<(), Error> {
+    if pos + lits.len() + m > dst.len() {
+        return Err(Error::OutputTooSmall);
+    }
+    dst[pos..pos + lits.len()].copy_from_slice(lits);
+    copy_match_cold(dst, pos + lits.len(), d, m);
+    Ok(())
 }

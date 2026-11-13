@@ -71,21 +71,69 @@ pub fn copy_match(out: &mut [u8], pos: usize, d: usize, m: usize) {
 // Spare bytes the fast copies may write past the requested end; callers leave this much room.
 pub const SLACK: usize = 32;
 
+// Exact slice copy, kept out of line so the fast paths' callers keep their registers.
+#[cold]
+#[inline(never)]
+fn copy_exact(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
+    dst[pos..pos + n].copy_from_slice(&src[at..at + n]);
+}
+
+// Exact match copy (short distances and buffer ends), kept out of line for the same reason.
+#[cold]
+#[inline(never)]
+pub fn copy_match_cold(out: &mut [u8], pos: usize, d: usize, m: usize) {
+    copy_match(out, pos, d, m);
+}
+
+// Copy 16 bytes from `s` to `d` with one unaligned load and store.
+// SAFETY (caller): both pointers are valid for 16 bytes.
+#[inline(always)]
+#[allow(unsafe_code)]
+unsafe fn copy16(s: *const u8, d: *mut u8) {
+    // SAFETY: guaranteed by the caller.
+    unsafe {
+        core::ptr::write_unaligned(
+            d.cast::<[u8; 16]>(),
+            core::ptr::read_unaligned(s.cast::<[u8; 16]>()),
+        )
+    }
+}
+
+// Copy 8 bytes from `s` to `d` with one unaligned load and store.
+// SAFETY (caller): both pointers are valid for 8 bytes.
+#[inline(always)]
+#[allow(unsafe_code)]
+unsafe fn copy8(s: *const u8, d: *mut u8) {
+    // SAFETY: guaranteed by the caller.
+    unsafe {
+        core::ptr::write_unaligned(d.cast::<u64>(), core::ptr::read_unaligned(s.cast::<u64>()))
+    }
+}
+
 // Copy `n` bytes from `src[at..]` to `dst[pos..]` in 16-byte steps, possibly writing up to 15 bytes past
 // `pos + n`. Falls back to an exact copy if either buffer lacks the 15 spare bytes.
+//
+// The first two steps are unrolled so short copies (the common case) stay plain loads and stores instead of the
+// `memcpy` call LLVM substitutes for a copy loop.
 #[inline(always)]
 #[allow(unsafe_code)]
 pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
     if at + n + 15 > src.len() || pos + n + 15 > dst.len() {
-        dst[pos..pos + n].copy_from_slice(&src[at..at + n]);
+        copy_exact(dst, pos, src, at, n);
         return;
     }
     let (s, d) = (src[at..].as_ptr(), dst[pos..].as_mut_ptr());
-    let mut c = 0;
-    while c < n {
-        // SAFETY: the check above keeps both 16-byte ranges inside their buffers, and `src` and `dst` are distinct.
-        unsafe { core::ptr::copy_nonoverlapping(s.add(c), d.add(c), 16) };
-        c += 16;
+    // SAFETY: the check above keeps every 16-byte step inside both buffers; `src` and `dst` are distinct slices.
+    unsafe {
+        copy16(s, d);
+        if n > 16 {
+            copy16(s.add(16), d.add(16));
+            let mut c = 32;
+            while c < n {
+                copy16(s.add(c), d.add(c));
+                c += 16;
+            }
+        }
     }
 }
 
@@ -95,17 +143,29 @@ pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
 #[allow(unsafe_code)]
 pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
     if d < 8 || d > pos || pos + m + 15 > out.len() {
-        copy_match(out, pos, d, m);
+        copy_match_cold(out, pos, d, m);
         return;
     }
-    let base = out.as_mut_ptr();
-    let step = if d >= 16 { 16 } else { 8 };
-    let mut c = 0;
-    while c < m {
-        // SAFETY: both ranges lie within `out` (checked above). With `step <= d` the source range ends at or before
-        // the destination range starts, so they never overlap, and each source byte was written by an earlier step.
-        unsafe { core::ptr::copy_nonoverlapping(base.add(pos - d + c), base.add(pos + c), step) };
-        c += step;
+    let dst = out[pos..].as_mut_ptr();
+    // SAFETY: both ranges lie within `out` (checked above). Each step copies at most `d` bytes, so its source range
+    // ends at or before its destination range starts and every source byte was written by an earlier step.
+    unsafe {
+        let src = dst.sub(d);
+        if d >= 16 {
+            copy16(src, dst);
+            let mut c = 16;
+            while c < m {
+                copy16(src.add(c), dst.add(c));
+                c += 16;
+            }
+        } else {
+            copy8(src, dst);
+            let mut c = 8;
+            while c < m {
+                copy8(src.add(c), dst.add(c));
+                c += 8;
+            }
+        }
     }
 }
 
@@ -167,9 +227,15 @@ mod tests {
                 let mut a: alloc::vec::Vec<u8> =
                     (0..200u8).chain(core::iter::repeat(0).take(200)).collect();
                 let mut b = a.clone();
+                let before = a.clone();
                 copy_match_wild(&mut a, 200, d, m);
                 reference::copy_match_wild(&mut b, 200, d, m);
-                assert_eq!(a, b, "d={d} m={m}");
+                assert_eq!(a[..200 + m], b[..200 + m], "d={d} m={m}");
+                assert_eq!(
+                    a[200 + m + 16..],
+                    before[200 + m + 16..],
+                    "wrote past the slack: d={d} m={m}"
+                );
             }
         }
         let src: alloc::vec::Vec<u8> = (0..120u8).collect();
@@ -177,7 +243,11 @@ mod tests {
             let (mut a, mut b) = ([0u8; 120], [0u8; 120]);
             wild_copy(&mut a, 3, &src, 5, n);
             reference::wild_copy(&mut b, 3, &src, 5, n);
-            assert_eq!(a, b, "n={n}");
+            assert_eq!(a[..3 + n], b[..3 + n], "n={n}");
+            assert!(
+                a[3 + n + 16..].iter().all(|&v| v == 0),
+                "wrote past the slack: n={n}"
+            );
         }
         // Without slack the kernels fall back to exact copies and stay in bounds.
         let mut tight = [0u8; 20];

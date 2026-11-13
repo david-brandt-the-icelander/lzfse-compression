@@ -133,11 +133,21 @@ LZVN is a byte-oriented LZ77 format with no entropy coding. Each opcode carries 
 
 ### 3.4 APFS transparent compression (decmpfs)
 
-- **Header:** the `com.apple.decmpfs` xattr holds a 16-byte header: magic `fpmc`, a `u32` compression type and a `u64` uncompressed size.
-- **Types:** type 11 stores LZFSE data inline in the xattr; type 12 stores it in the resource fork.
-- **Resource fork layout:** a fork header, a table of 64 KiB block offsets, the blocks themselves, and a fixed resource map. This is the same as the zlib type 4 layout prototyped in the `free-disk-space` branch (since removed).
-- **Per block:** each 64 KiB block is believed to be a complete LZFSE stream, ending with `bvx$` (**verify**). An incompressible block is stored raw behind a one-byte marker (**verify** the marker value for LZFSE).
-- **How we check:** parse already-compressed files that ship with macOS (under `/System` and `/usr`) and read files we compress back through the kernel.
+Verified on Apple Silicon in CI (`tests/apple.rs`).
+
+- **Header:** the `com.apple.decmpfs` xattr starts with a 16-byte header: magic `fpmc`, a little-endian `u32`
+  compression type and a `u64` uncompressed size.
+- **Inline types (7 LZVN, 11 LZFSE):** the compressed data follows the header in the same xattr, as long as the
+  whole attribute fits in 3,802 bytes.
+- **Resource-fork types (8 LZVN, 12 LZFSE):** `com.apple.ResourceFork` holds a table of little-endian `u32`
+  offsets, one per 64 KiB chunk plus one for the end, followed by the chunks. Each chunk is a complete stream. This
+  is simpler than zlib's type 4, which wraps its chunks in a classic resource map.
+- **Verified both ways:**
+  - The kernel reads back files we write with types 11 and 12 and accepts the compressed flag.
+  - Our parser decodes 3,494 type-8 files that macOS itself compressed (on the runner image) to exactly what the
+    kernel returns.
+- **Raw chunks:** we never need a raw-chunk marker. An incompressible chunk becomes an LZFSE stream with a `bvx-`
+  block. The parser also accepts a one-byte marker followed by raw data, as older tools write.
 
 ## 4. Architecture
 
@@ -148,7 +158,6 @@ crates/
   lzfse/         library: format, FSE, LZVN, match finder, block and stream codecs
   lzfse-cli/     encode / decode / inspect command line tool
   lzfse-bench/   benchmark harness (section 6), with libcompression and reference FFI
-  lzfse-sys-ref/ test-only build of the BSD reference, fetched in CI and never shipped
 fuzz/            cargo-fuzz targets
 docs/            this design, benchmark reports
 ```
@@ -175,7 +184,7 @@ docs/            this design, benchmark reports
 
 ### 4.3 Safety boundary
 
-- **Safe reference path:** the library's portable path is safe Rust. The decoder crate root uses `#![deny(unsafe_code)]`, with exceptions allowed only inside `kernels`.
+- **Safe reference path:** the library's portable path is safe Rust. The crate root uses `#![deny(unsafe_code)]`; the only exceptions are the copy kernels in `kernels`, which check their bounds once and are tested against safe references.
 - **Rules for any `unsafe`, C or assembly kernel:**
   - It has a `// SAFETY:` justification.
   - It sits behind the same interface as a safe Rust reference kernel.
@@ -304,14 +313,14 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 
 ## 8. Milestones
 
-| # | Deliverable | Done when |
-|---|---|---|
-| M0 | This document, workspace skeleton, CI on macOS and Linux, lint rules | The plan is approved and CI is green on an empty workspace |
-| M1 | Decoder: `bvx-`, `bvxn`, `bvx1`, `bvx2`, `bvx$` | It decodes Apple's output in CI and the decoder fuzz and property tests are clean |
-| M2 | Scalar encoder: LZVN and LZFSE `bvx2` | The compatibility matrix is green and the ratio is within 2% of Apple's |
-| M3 | Benchmark harness and first report | A reproducible baseline report against `libcompression` and the reference |
-| M4 | Optimisation: parallel chunks, then kernels (Rust, then NEON, then C or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential fuzzing |
-| M5 | decmpfs writer and `free-disk-space` integration | Type 12 files read back through the kernel. The section 3.4 **verify** items are resolved |
+| # | Deliverable | Done when | Status |
+|---|---|---|---|
+| M0 | This document, workspace skeleton, CI on macOS and Linux, lint rules | The plan is approved and CI is green | Done |
+| M1 | Decoder: `bvx-`, `bvxn`, `bvx1`, `bvx2`, `bvx$` | It decodes Apple's output in CI and the decoder fuzz and property tests are clean | Done |
+| M2 | Scalar encoder: LZVN and LZFSE `bvx2` | The compatibility matrix is green and the ratio is within 2% of Apple's | Done: within ±0.6% |
+| M3 | Benchmark harness and first report | A reproducible baseline report against `libcompression` | Done: `docs/benchmarks` |
+| M4 | Optimisation: parallel chunks, then kernels (Rust, then NEON, then C or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential tests | In progress: parallel and literal-heavy cases beat Apple; single-threaded text and binary do not yet |
+| M5 | decmpfs writer and `free-disk-space` integration | Type 11/12 files read back through the kernel | Writer done and kernel-verified; wiring into `free-disk-space` waits for this crate to be merged |
 
 ## 9. Owner decisions
 
