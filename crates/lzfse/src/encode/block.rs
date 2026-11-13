@@ -8,17 +8,23 @@ use crate::fse::{self, EncEntry};
 // Spare bytes after the literal buffer so wide copies and padding never run out of room.
 const LIT_SLACK: usize = 32;
 
-// Token buffers for the block being built; reused across blocks and calls.
+// One L/M/D token and, once the block is encoded, its three symbols.
+#[derive(Clone, Copy, Default)]
+struct Token {
+    l: u32,
+    m: u32,
+    d: u32,
+    sym: [u8; 3],
+}
+
+// Token and literal buffers for the block being built; reused across blocks and calls (two allocations in all).
 pub struct Blocks {
     block_start: usize,
     raw: usize,
-    l: Vec<u32>,
-    m: Vec<u32>,
-    d: Vec<u32>,
+    tokens: Vec<Token>,
     // Fixed-size literal buffer with slack for 16-byte copies; `n_lits` bytes are in use.
     lits: Vec<u8>,
     n_lits: usize,
-    syms: Vec<[u8; 3]>,
 }
 
 impl Blocks {
@@ -27,12 +33,9 @@ impl Blocks {
         Blocks {
             block_start: 0,
             raw: 0,
-            l: Vec::new(),
-            m: Vec::new(),
-            d: Vec::new(),
+            tokens: Vec::new(),
             lits: Vec::new(),
             n_lits: 0,
-            syms: Vec::new(),
         }
     }
 
@@ -41,10 +44,7 @@ impl Blocks {
     pub fn reset(&mut self) {
         self.block_start = 0;
         self.clear();
-        self.l.reserve(MATCHES_PER_BLOCK);
-        self.m.reserve(MATCHES_PER_BLOCK);
-        self.d.reserve(MATCHES_PER_BLOCK);
-        self.syms.reserve(MATCHES_PER_BLOCK);
+        self.tokens.reserve(MATCHES_PER_BLOCK);
         if self.lits.len() < LITERALS_PER_BLOCK + LIT_SLACK {
             self.lits.resize(LITERALS_PER_BLOCK + LIT_SLACK, 0);
         }
@@ -53,10 +53,7 @@ impl Blocks {
     // Drop the buffered tokens.
     fn clear(&mut self) {
         self.raw = 0;
-        self.l.clear();
-        self.m.clear();
-        self.d.clear();
-        self.syms.clear();
+        self.tokens.clear();
         self.n_lits = 0;
     }
 
@@ -88,12 +85,15 @@ impl Blocks {
     // Append one in-range token, closing the block first if it is full.
     #[inline(always)]
     fn token(&mut self, src: &[u8], lit: usize, n: usize, m: u32, d: u32, out: &mut Vec<u8>) {
-        if self.l.len() + 1 > MATCHES_PER_BLOCK || self.n_lits + n + 3 > LITERALS_PER_BLOCK {
+        if self.tokens.len() + 1 > MATCHES_PER_BLOCK || self.n_lits + n + 3 > LITERALS_PER_BLOCK {
             self.flush(src, out);
         }
-        self.l.push(n as u32);
-        self.m.push(m);
-        self.d.push(d);
+        self.tokens.push(Token {
+            l: n as u32,
+            m,
+            d,
+            sym: [0; 3],
+        });
         // Wide copy; any overshoot lands in the slack and is overwritten by the next literals.
         crate::kernels::wild_copy(&mut self.lits, self.n_lits, src, lit, n);
         self.n_lits += n;
@@ -102,7 +102,7 @@ impl Blocks {
 
     // Encode the buffered tokens as one block, falling back to a raw block if that is smaller.
     pub fn flush(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        if self.l.is_empty() {
+        if self.tokens.is_empty() {
             return;
         }
         let mark = out.len();
@@ -119,7 +119,6 @@ impl Blocks {
 
     // Entropy-code the buffered tokens and append them to `out` as a `bvx2` block.
     fn encode_block(&mut self, out: &mut Vec<u8>) {
-        let (l, m) = (&self.l, &self.m);
         while self.n_lits % 4 != 0 {
             self.lits[self.n_lits] = 0;
             self.n_lits += 1;
@@ -127,30 +126,28 @@ impl Blocks {
         let lits = &self.lits[..self.n_lits];
         // Distance 0 means "same as the previous token"; literal-only tokens reuse the previous distance too.
         let mut prev: Option<u32> = None;
-        for (dist, &len) in self.d.iter_mut().zip(m) {
-            let want = if len == 0 { prev.unwrap_or(1) } else { *dist };
+        for t in self.tokens.iter_mut() {
+            let want = if t.m == 0 { prev.unwrap_or(1) } else { t.d };
             if prev == Some(want) {
-                *dist = 0;
+                t.d = 0;
             } else {
-                *dist = want;
+                t.d = want;
                 prev = Some(want);
             }
         }
-        let dv = &self.d;
         let mut h = BlockHeader::empty();
         h.n_raw = self.raw as u32;
         h.n_literals = lits.len() as u32;
-        h.n_matches = l.len() as u32;
+        h.n_matches = self.tokens.len() as u32;
         let mut lc = [0u32; LIT_SYMBOLS];
         lits.iter().for_each(|&b| lc[b as usize] += 1);
         let (mut l_c, mut m_c, mut d_c) = ([0u32; L_SYMBOLS], [0u32; M_SYMBOLS], [0u32; D_SYMBOLS]);
-        self.syms.clear();
-        for i in 0..l.len() {
-            let s = [l_symbol(l[i]), m_symbol(m[i]), d_symbol(dv[i])];
+        for t in self.tokens.iter_mut() {
+            let s = [l_symbol(t.l), m_symbol(t.m), d_symbol(t.d)];
             l_c[s[0]] += 1;
             m_c[s[1]] += 1;
             d_c[s[2]] += 1;
-            self.syms.push(s.map(|v| v as u8));
+            t.sym = s.map(|v| v as u8);
         }
         fse::normalize(&lc, LIT_STATES, &mut h.lit_freq);
         fse::normalize(&l_c, L_STATES, &mut h.l_freq);
@@ -191,13 +188,13 @@ impl Blocks {
         out.extend_from_slice(&[0u8; 8]);
         let mut w = BitWriter::new();
         let (mut ls, mut ms, mut ds) = (0u32, 0u32, 0u32);
-        for i in (0..l.len()).rev() {
-            let [a, b, c] = self.syms[i].map(|v| v as usize);
-            w.push(D_EXTRA[c] as u32, (dv[i] - D_BASE[c]) as u64);
+        for t in self.tokens.iter().rev() {
+            let [a, b, c] = t.sym.map(|v| v as usize);
+            w.push(D_EXTRA[c] as u32, (t.d - D_BASE[c]) as u64);
             fse::encode(&mut ds, &d_enc[c], &mut w);
-            w.push(M_EXTRA[b] as u32, (m[i] - M_BASE[b]) as u64);
+            w.push(M_EXTRA[b] as u32, (t.m - M_BASE[b]) as u64);
             fse::encode(&mut ms, &m_enc[b], &mut w);
-            w.push(L_EXTRA[a] as u32, (l[i] - L_BASE[a]) as u64);
+            w.push(L_EXTRA[a] as u32, (t.l - L_BASE[a]) as u64);
             fse::encode(&mut ls, &l_enc[a], &mut w);
             w.flush(out);
         }

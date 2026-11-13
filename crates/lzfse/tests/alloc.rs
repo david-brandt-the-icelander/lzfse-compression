@@ -200,3 +200,30 @@ fn chunked_encoding() {
         c.0
     );
 }
+
+// Breakdown of the cold start (run alone: `cargo test --release --test alloc cold_start -- --exact --nocapture`).
+#[test]
+#[ignore]
+fn cold_start() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let big = text(4 << 20);
+    let opts = lzfse::Options::default();
+    let pool = count_all_threads(|| {
+        lzfse::parallelism();
+    });
+    let (mut arena, mut offsets) = (Vec::new(), Vec::new());
+    let first = count_all_threads(|| {
+        lzfse::encode_chunks_into(&big, 65_536, &opts, &mut arena, &mut offsets)
+    });
+    arena.clear();
+    let second = count_all_threads(|| {
+        lzfse::encode_chunks_into(&big, 65_536, &opts, &mut arena, &mut offsets)
+    });
+    arena.clear();
+    let third = count_all_threads(|| {
+        lzfse::encode_chunks_into(&big, 65_536, &opts, &mut arena, &mut offsets)
+    });
+    let owned = count_all_threads(|| drop(lzfse::encode_chunks_with(&big, 65_536, &opts)));
+    println!("threads {}", lzfse::parallelism());
+    println!("pool start {pool:?}\nfirst encode_chunks_into {first:?}\nsecond {second:?}\nthird {third:?}\nencode_chunks_with (owned) {owned:?}");
+}
