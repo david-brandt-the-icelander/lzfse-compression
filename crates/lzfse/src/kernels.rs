@@ -68,6 +68,51 @@ pub fn copy_match(out: &mut [u8], pos: usize, d: usize, m: usize) {
     }
 }
 
+// Spare bytes the fast copies may write past the requested end; callers leave this much room.
+pub const SLACK: usize = 32;
+
+// Copy 16 bytes within `buf` from `from` to `to` through a register-sized temporary.
+#[inline(always)]
+fn move16(buf: &mut [u8], from: usize, to: usize) {
+    let mut t = [0u8; 16];
+    t.copy_from_slice(&buf[from..from + 16]);
+    buf[to..to + 16].copy_from_slice(&t);
+}
+
+// Copy `n` bytes from `src[at..]` to `dst[pos..]` in 16-byte steps, possibly writing up to 15 bytes past
+// `pos + n`; both buffers must have `SLACK` spare bytes past the copied range.
+#[inline(always)]
+pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
+    let mut c = 0;
+    while c < n {
+        dst[pos + c..pos + c + 16].copy_from_slice(&src[at + c..at + c + 16]);
+        c += 16;
+    }
+}
+
+// Like `copy_match`, but with wide steps that may write up to 15 bytes past `pos + m`; `out` must have
+// `SLACK` spare bytes past the match. The caller guarantees `1 <= d <= pos`.
+#[inline(always)]
+pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
+    if d >= 16 {
+        let mut c = 0;
+        while c < m {
+            move16(out, pos - d + c, pos + c);
+            c += 16;
+        }
+    } else if d >= 8 {
+        let mut c = 0;
+        while c < m {
+            let mut t = [0u8; 8];
+            t.copy_from_slice(&out[pos - d + c..pos - d + c + 8]);
+            out[pos + c..pos + c + 8].copy_from_slice(&t);
+            c += 8;
+        }
+    } else {
+        copy_match(out, pos, d, m);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +132,25 @@ mod tests {
                 assert_eq!(a, b, "d={d} m={m}");
             }
         }
+    }
+
+    // The wide copies produce the same bytes as the exact ones inside the requested range.
+    #[test]
+    fn wild_copies_match_exact() {
+        for d in 1..40 {
+            for m in 0..90 {
+                let mut a: alloc::vec::Vec<u8> =
+                    (0..200u8).chain(core::iter::repeat(0).take(200)).collect();
+                let mut b = a.clone();
+                copy_match_wild(&mut a, 200, d, m);
+                copy_match(&mut b, 200, d, m);
+                assert_eq!(a[..200 + m], b[..200 + m], "d={d} m={m}");
+            }
+        }
+        let src: alloc::vec::Vec<u8> = (0..100u8).collect();
+        let mut dst = [0u8; 100];
+        wild_copy(&mut dst, 3, &src, 5, 40);
+        assert_eq!(dst[3..43], src[5..45]);
     }
 
     // Match lengths stop at the first difference and at the end of the buffer.

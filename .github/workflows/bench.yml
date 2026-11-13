@@ -1,0 +1,33 @@
+# Benchmark against Apple's libcompression on an Apple Silicon runner and publish the report in the job summary.
+# Shared CI runners are noisy: use these numbers to spot regressions; the owner's Mac gives the authoritative ones.
+name: Bench
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run
+        env:
+          RUSTFLAGS: -C target-cpu=apple-m1
+        run: |
+          cargo run --release -p lzfse-bench -- --runs 7 > report.md
+          cat report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: report.md

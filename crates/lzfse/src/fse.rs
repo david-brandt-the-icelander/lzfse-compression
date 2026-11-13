@@ -195,18 +195,26 @@ pub fn value_table(
     })
 }
 
-// Decode one literal, updating the state.
+// Decode one literal, updating the state; the mask is a no-op for valid states and removes the bounds check.
 #[inline(always)]
-pub fn decode_literal(state: &mut u32, table: &[LitEntry], r: &mut BitReader) -> u8 {
-    let e = table[*state as usize];
+pub fn decode_literal<const N: usize>(
+    state: &mut u32,
+    table: &[LitEntry; N],
+    r: &mut BitReader,
+) -> u8 {
+    let e = table[*state as usize & (N - 1)];
     *state = e.base as u32 + r.pull(e.k as u32);
     e.symbol
 }
 
-// Decode one L, M or D value, updating the state.
+// Decode one L, M or D value, updating the state; the mask only removes the bounds check.
 #[inline(always)]
-pub fn decode_value(state: &mut u32, table: &[ValueEntry], r: &mut BitReader) -> u32 {
-    let e = table[*state as usize];
+pub fn decode_value<const N: usize>(
+    state: &mut u32,
+    table: &[ValueEntry; N],
+    r: &mut BitReader,
+) -> u32 {
+    let e = table[*state as usize & (N - 1)];
     let bits = r.pull(e.total_bits as u32);
     *state = e.base as u32 + (bits >> e.value_bits);
     e.vbase + (bits & ((1u32 << e.value_bits) - 1))
@@ -271,10 +279,12 @@ mod tests {
             let bits = w.finish(&mut out);
             let mut table = Vec::new();
             literal_table(&freq, n, &mut table).unwrap();
+            table.resize(1024, LitEntry::default());
+            let fixed: &[LitEntry; 1024] = table.as_slice().try_into().unwrap();
             let mut r = BitReader::new(&out, bits).unwrap();
             for &b in &data {
                 r.refill().unwrap();
-                assert_eq!(decode_literal(&mut state, &table, &mut r), b);
+                assert_eq!(decode_literal(&mut state, fixed, &mut r), b);
             }
             assert_eq!(state, 0, "decoder ends where the encoder started");
         }

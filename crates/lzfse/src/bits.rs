@@ -96,8 +96,8 @@ impl<'a> BitReader<'a> {
     // Take the `n` most recently written bits; a refill must have made them available.
     #[inline(always)]
     pub fn pull(&mut self, n: u32) -> u32 {
+        // Refills keep at least 56 bits and no caller pulls more than 54 between refills.
         debug_assert!(n <= 32 && n <= self.nbits);
-        let n = n.min(self.nbits);
         self.nbits -= n;
         let value = (self.accum >> self.nbits) as u32;
         self.accum &= (1u64 << self.nbits) - 1;

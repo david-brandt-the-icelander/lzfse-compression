@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::bits::BitReader;
 use crate::format::*;
 use crate::fse::{self, LitEntry, ValueEntry};
-use crate::kernels::copy_match;
+use crate::kernels::{copy_match, copy_match_wild, wild_copy, SLACK};
 use crate::{lzvn, Error};
 
 // Reusable per-block decoding tables and literal buffer.
@@ -148,14 +148,17 @@ fn decode_literals(h: &BlockHeader, src: &[u8], s: &mut Scratch) -> Result<(), E
     fse::literal_table(&h.lit_freq, LIT_STATES, &mut s.lit)?;
     let count = (h.n_literals as usize + 3) & !3;
     s.literals.clear();
-    s.literals.resize(count, 0);
+    s.literals.resize(count + SLACK, 0);
     let mut r = BitReader::new(src, h.literal_bits)?;
-    let mut st = h.literal_state.map(|v| v as u32);
-    for group in s.literals.chunks_exact_mut(4) {
+    let table: &[LitEntry; LIT_STATES as usize] =
+        s.lit.as_slice().try_into().map_err(|_| Error::Corrupt)?;
+    let [mut s0, mut s1, mut s2, mut s3] = h.literal_state.map(|v| v as u32);
+    for group in s.literals[..count].chunks_exact_mut(4) {
         r.refill()?;
-        for (byte, state) in group.iter_mut().zip(st.iter_mut()) {
-            *byte = fse::decode_literal(state, &s.lit, &mut r);
-        }
+        group[0] = fse::decode_literal(&mut s0, table, &mut r);
+        group[1] = fse::decode_literal(&mut s1, table, &mut r);
+        group[2] = fse::decode_literal(&mut s2, table, &mut r);
+        group[3] = fse::decode_literal(&mut s3, table, &mut r);
     }
     Ok(())
 }
@@ -171,33 +174,44 @@ fn decode_tokens(
     fse::value_table(&h.l_freq, L_STATES, &L_EXTRA, &L_BASE, &mut s.l)?;
     fse::value_table(&h.m_freq, M_STATES, &M_EXTRA, &M_BASE, &mut s.m)?;
     fse::value_table(&h.d_freq, D_STATES, &D_EXTRA, &D_BASE, &mut s.d)?;
+    let lt: &[ValueEntry; L_STATES as usize] =
+        s.l.as_slice().try_into().map_err(|_| Error::Corrupt)?;
+    let mt: &[ValueEntry; M_STATES as usize] =
+        s.m.as_slice().try_into().map_err(|_| Error::Corrupt)?;
+    let dt: &[ValueEntry; D_STATES as usize] =
+        s.d.as_slice().try_into().map_err(|_| Error::Corrupt)?;
     let mut r = BitReader::new(lmd, h.lmd_bits)?;
     let (mut ls, mut ms, mut ds) = (h.l_state as u32, h.m_state as u32, h.d_state as u32);
     let mut lit = 0usize;
+    let n_lits = s.literals.len() - SLACK;
     let mut d_prev: Option<usize> = None;
     for _ in 0..h.n_matches {
         r.refill()?;
-        let l = fse::decode_value(&mut ls, &s.l, &mut r) as usize;
-        let m = fse::decode_value(&mut ms, &s.m, &mut r) as usize;
-        let d_new = fse::decode_value(&mut ds, &s.d, &mut r) as usize;
+        let l = fse::decode_value(&mut ls, lt, &mut r) as usize;
+        let m = fse::decode_value(&mut ms, mt, &mut r) as usize;
+        let d_new = fse::decode_value(&mut ds, dt, &mut r) as usize;
         let d = if d_new != 0 {
             d_new
         } else {
             d_prev.ok_or(Error::Corrupt)?
         };
         d_prev = Some(d);
-        let lits = s.literals.get(lit..lit + l).ok_or(Error::Corrupt)?;
-        if d > pos + l {
+        if lit + l > n_lits || d > pos + l {
             return Err(Error::Corrupt);
         }
-        if pos + l + m > dst.len() {
-            return Err(Error::OutputTooSmall);
+        if pos + l + m + SLACK <= dst.len() {
+            // Fast path: wide copies that may scribble into the slack past the token, which later tokens overwrite.
+            wild_copy(dst, pos, &s.literals, lit, l);
+            copy_match_wild(dst, pos + l, d, m);
+        } else {
+            if pos + l + m > dst.len() {
+                return Err(Error::OutputTooSmall);
+            }
+            dst[pos..pos + l].copy_from_slice(&s.literals[lit..lit + l]);
+            copy_match(dst, pos + l, d, m);
         }
-        dst[pos..pos + l].copy_from_slice(lits);
         lit += l;
-        pos += l;
-        copy_match(dst, pos, d, m);
-        pos += m;
+        pos += l + m;
     }
     Ok(pos)
 }
