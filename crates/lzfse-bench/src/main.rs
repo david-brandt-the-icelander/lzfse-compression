@@ -325,8 +325,13 @@ fn measure(input: &Input, chunk: usize, runs: usize, threads: usize) -> Vec<Row>
         (c.enc)();
         (c.dec)();
     }
-    for _ in 0..runs {
-        for (c, (e, d)) in cs.iter_mut().zip(samples.iter_mut()) {
+    // The input is already in memory, so no file I/O is timed. The contender that goes first rotates each run, so
+    // none of them is always the one that finds the input still warm in the CPU caches.
+    for run in 0..runs {
+        let n = cs.len();
+        for k in 0..n {
+            let i = (run + k) % n;
+            let (c, (e, d)) = (&mut cs[i], &mut samples[i]);
             let t = Instant::now();
             (c.enc)();
             e.push(t.elapsed().as_secs_f64());

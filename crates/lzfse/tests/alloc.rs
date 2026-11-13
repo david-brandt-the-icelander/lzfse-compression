@@ -150,9 +150,10 @@ fn one_shot_allocations_are_bounded() {
             lzfse::decode_into(&packed, &mut buf).unwrap();
         });
         println!("{n:>8} bytes: encode {e:?}  decode {d:?}  decode_into {di:?}");
-        // Encoder: output growth, hash table (at most 512 KiB) and one block's token buffers (about 190 KB).
+        // Encoder: output growth, the hash tables (at most 512 KiB + 256 KiB) and one block's token buffers
+        // (about 190 KB).
         assert!(e.0 <= 10, "encode() made {} allocations", e.0);
-        assert!(e.1 <= 2 * n + 800_000, "encode() requested {} bytes", e.1);
+        assert!(e.1 <= 2 * n + 1_100_000, "encode() requested {} bytes", e.1);
         // Decoder: the output plus the literal buffer (at most 40 KB).
         assert!(d.0 <= 2 && d.1 <= n + 41_000, "decode() {d:?}");
         assert!(di.0 <= 1 && di.1 <= 41_000, "decode_into() {di:?}");

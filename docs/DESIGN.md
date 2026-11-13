@@ -170,7 +170,7 @@ docs/            this design, benchmark reports
 | `bits` | Forward and backward bit writers and readers |
 | `fse` | Normalising frequency tables, building encode and decode tables, encoding and decoding |
 | `lzvn` | LZVN encoder and decoder |
-| `matchfind` | Hash-chain match finder, which has the most tuning knobs |
+| `encode` | Match finder: two hash tables (section 4.2.1), lazy evaluation, skip-ahead; `encode::block` collects tokens and entropy-codes each block |
 | `block` | One LZFSE block: tokenise, then entropy-code, or the reverse |
 | `stream` | Splitting into blocks, choosing the block type, the end marker, the public API |
 | `parallel` | Block-parallel compression of independent chunks (decmpfs-style) |
@@ -181,6 +181,30 @@ docs/            this design, benchmark reports
 - A streaming encoder and decoder.
 - `compress_chunks(input, chunk_size, threads)` for decmpfs-style independent 64 KiB blocks.
 - Every decode path enforces an explicit output-size limit.
+
+#### 4.2.1 Match finder
+
+Two tables are probed at every position, after the previous distance:
+- **Short table:** 4-way buckets keyed on 4 bytes. It finds the short matches binaries and source code live on.
+- **Long table:** one position per slot, keyed on 8 bytes, with four times as many slots.
+
+Common short strings (frequent words, JSON keys) refill the short buckets constantly. They push out the one
+candidate that starts a long repeat, so with the short table alone the encoder settled for many 10–15-byte matches.
+The long table keeps those starts.
+
+Hashing more bytes in the single table was tried first and rejected. It helped repetitive text but cost real
+binaries up to 8% of ratio, because they depend on 4–6-byte matches.
+
+Measured on a 4 MiB session-log-like input (`tests/apple.rs`, `session_like`):
+
+| Encoder | 1 MiB chunks | Whole |
+|---|---:|---:|
+| Apple's | 328,753 bytes | 289,447 bytes |
+| Short table only | 595,996 bytes | 588,593 bytes |
+| Both tables | 120,709 bytes | 89,207 bytes |
+
+On real binaries, libraries, man pages, JSON and source, the change was 0.2–3% smaller with both tables, never
+larger.
 
 ### 4.3 Safety boundary
 

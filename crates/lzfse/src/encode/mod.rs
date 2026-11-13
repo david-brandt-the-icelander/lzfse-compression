@@ -4,7 +4,7 @@ mod block;
 use alloc::vec::Vec;
 
 use crate::format::*;
-use crate::kernels::{load4, match_len, match_len_back};
+use crate::kernels::{load4, load8, match_len, match_len_back};
 use crate::lzvn;
 use block::Blocks;
 
@@ -16,11 +16,15 @@ pub const LZVN_THRESHOLD: usize = 4096;
 // Positions are stored as u32, so very large inputs are cut into independent segments of this size.
 const SEGMENT: usize = 1 << 30;
 const WAYS: usize = 4;
+// The long table (keyed on 8 bytes, one position per slot) has 2^LONG_EXTRA times as many slots as the short
+// table has buckets.
+const LONG_EXTRA: u32 = 2;
 
 /// Encoder tuning knobs. The defaults aim for Apple's compression ratio at higher speed.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// log2 of the number of match-finder hash buckets (each holds 4 candidates).
+    /// log2 of the number of match-finder hash buckets (each holds 4 candidates keyed on 4 bytes); the second
+    /// table, keyed on 8 bytes, has four times as many single-position slots.
     pub hash_bits: u32,
     /// Stop searching (and skip lazy evaluation) once a match is at least this long.
     pub good_match: usize,
@@ -70,6 +74,8 @@ fn push_raw(out: &mut Vec<u8>, src: &[u8]) {
 pub struct Encoder {
     opts: Options,
     table: Vec<Bucket>,
+    // Positions keyed on 8 bytes: common short strings cannot evict the starts of long repeats from it.
+    long: Vec<u32>,
     // Added to positions before they are stored, so entries from earlier inputs are recognisably stale.
     base: u32,
     blocks: Blocks,
@@ -87,6 +93,7 @@ impl Encoder {
         Encoder {
             opts,
             table: Vec::new(),
+            long: Vec::new(),
             base: 1,
             blocks: Blocks::new(),
             lzvn_table: Vec::new(),
@@ -132,6 +139,8 @@ impl Encoder {
             let size = (1usize << bits).max(self.table.len());
             self.table.clear();
             self.table.resize(size, Bucket::default());
+            self.long.clear();
+            self.long.resize(size << LONG_EXTRA, 0);
             self.base = 1;
         }
         bits
@@ -144,6 +153,8 @@ impl Encoder {
         let mut f = Finder {
             src,
             table: &mut self.table,
+            long: &mut self.long,
+            lshift: 64 - bits - LONG_EXTRA,
             shift: 32 - bits,
             good: opts.good_match,
             base: self.base,
@@ -212,6 +223,8 @@ struct Match {
 struct Finder<'a> {
     src: &'a [u8],
     table: &'a mut [Bucket],
+    long: &'a mut [u32],
+    lshift: u32,
     shift: u32,
     good: usize,
     base: u32,
@@ -224,21 +237,38 @@ impl Finder<'_> {
         (x.wrapping_mul(0x9E37_79B1) >> self.shift) as usize
     }
 
-    // Record position `i` (whose 4 bytes are `x`) in its bucket, evicting the oldest entry.
+    // Hash 8 bytes into a long-table slot.
+    #[inline(always)]
+    fn lhash(&self, y: u64) -> usize {
+        (y.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.lshift) as usize
+    }
+
+    // Record position `i` (whose 4 bytes are `x`) in both tables.
     #[inline(always)]
     fn insert(&mut self, i: usize, x: u32) {
+        self.insert_short(i, x);
+        let lh = self.lhash(load8(self.src, i));
+        self.long[lh] = self.base + i as u32;
+    }
+
+    // Record position `i` in its bucket of the 4-byte table, evicting the oldest entry.
+    #[inline(always)]
+    fn insert_short(&mut self, i: usize, x: u32) {
         let h = self.hash(x);
         let b = &mut self.table[h];
         b.pos = [self.base + i as u32, b.pos[0], b.pos[1], b.pos[2]];
         b.val = [x, b.val[0], b.val[1], b.val[2]];
     }
 
-    // Find the best match at `i` (not starting before `lit`) among the bucket and the previous distance, then
-    // insert `i`.
+    // Find the best match at `i` (not starting before `lit`) among the previous distance, the long table and the
+    // bucket, then insert `i`.
     #[inline(always)]
     fn find(&mut self, i: usize, lit: usize, d_prev: usize) -> Option<Match> {
-        let x = load4(self.src, i);
+        let y = load8(self.src, i);
+        let x = y as u32;
         let b = self.table[self.hash(x)];
+        let lh = self.lhash(y);
+        let lp = self.long[lh];
         let mut best = Match {
             start: i,
             len: 0,
@@ -249,6 +279,23 @@ impl Finder<'_> {
             best.dist = d_prev;
         }
         let here = self.base + i as u32;
+        self.long[lh] = here;
+        let dist = here.wrapping_sub(lp) as usize;
+        if best.len < self.good
+            && dist != 0
+            && dist <= i
+            && dist <= MAX_D as usize
+            && load8(self.src, i - dist) == y
+        {
+            let len = 8 + match_len(self.src, i - dist + 8, i + 8);
+            if len > best.len {
+                best = Match {
+                    start: i,
+                    len,
+                    dist,
+                };
+            }
+        }
         for k in 0..WAYS {
             if best.len >= self.good {
                 break;
@@ -271,7 +318,7 @@ impl Finder<'_> {
                 };
             }
         }
-        self.insert(i, x);
+        self.insert_short(i, x);
         if best.len < 4 {
             return None;
         }
