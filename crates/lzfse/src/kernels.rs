@@ -146,6 +146,17 @@ pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
         copy_match_cold(out, pos, d, m);
         return;
     }
+    if d == 1 {
+        // A run of one byte: memset speed.
+        let b = out[pos - 1];
+        out[pos..pos + m].fill(b);
+        return;
+    }
+    if d < 8 && m > 64 {
+        // Long runs of a short pattern: copying in doubling chunks beats fixed 8-byte steps.
+        copy_match_cold(out, pos, d, m);
+        return;
+    }
     if d < 8 {
         // Write the first 8 bytes one by one (the pattern repeats every `d`), then copy 8 bytes per step from `p`
         // back, where `p` is the smallest multiple of `d` that is at least 8, so source and destination never
