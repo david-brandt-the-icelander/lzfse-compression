@@ -193,20 +193,94 @@ fn lzvn_both_directions() {
 // Our compression ratio stays within 2% of Apple's on compressible inputs (milestone M2).
 #[test]
 fn ratio_close_to_apple() {
-    for (name, data) in corpus() {
-        if data.len() < 65_536 || name == "noise" {
-            continue;
+    let mut inputs: Vec<(String, Vec<u8>)> = corpus()
+        .into_iter()
+        .filter(|(name, data)| data.len() >= 65_536 && name != "noise")
+        .collect();
+    inputs.push(("session log".into(), session_like(4 << 20, false)));
+    inputs.push(("session+b64".into(), session_like(4 << 20, true)));
+    let mut worst = 0.0f64;
+    for (name, data) in &inputs {
+        for chunk in [65_536usize, 1 << 20, usize::MAX] {
+            let chunk = chunk.min(data.len());
+            let (mut theirs, mut ours) = (0usize, 0usize);
+            for piece in data.chunks(chunk) {
+                theirs += apple_encode(piece, LZFSE).len();
+                ours += encode(piece).len();
+            }
+            let diff = 100.0 * (ours as f64 / theirs as f64 - 1.0);
+            worst = worst.max(diff);
+            println!("{name:>14} {chunk:>9}: apple {theirs:>9}  ours {ours:>9}  ({diff:+.2}%)");
         }
-        let (theirs, ours) = (apple_encode(&data, LZFSE).len(), encode(&data).len());
-        println!(
-            "{name:>14}: apple {theirs:>9}  ours {ours:>9}  ({:+.2}%)",
-            100.0 * (ours as f64 / theirs as f64 - 1.0)
-        );
-        assert!(
-            ours as f64 <= theirs as f64 * 1.02 + 64.0,
-            "{name}: ours {ours} vs apple {theirs}"
-        );
     }
+    assert!(
+        worst <= 2.0,
+        "worst ratio gap {worst:+.2}% (see the table above)"
+    );
+}
+
+// Session-log-like JSON lines: short messages, re-read documents and re-sent earlier context (long-range
+// repeats), optionally with large base64 attachments, like the Claude Code logs free-disk-space compresses.
+fn session_like(n: usize, blobs: bool) -> Vec<u8> {
+    let mut x = 0x9E37_79B9u32;
+    let mut rnd = move || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x
+    };
+    let vocab = [
+        "the", "quick", "brown", "fox", "jumps", "over", "a", "lazy", "dog", "and", "of", "to",
+        "in", "is",
+    ];
+    let words = |k: u32, rnd: &mut dyn FnMut() -> u32| -> String {
+        (0..k)
+            .map(|_| vocab[rnd() as usize % vocab.len()])
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let docs: Vec<String> = (0..30)
+        .map(|_| {
+            let k = 200 + rnd() % 1800;
+            words(k, &mut rnd)
+        })
+        .collect();
+    let b64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut msgs, mut out): (Vec<String>, Vec<u8>) = (Vec::new(), Vec::new());
+    while out.len() < n {
+        let k = rnd() % 100;
+        let m = if k < 45 {
+            let c = 20 + rnd() % 180;
+            words(c, &mut rnd)
+        } else if k < 70 {
+            docs[rnd() as usize % docs.len()].clone()
+        } else if k < 95 || !blobs {
+            let back = (1 + rnd() as usize % 10).min(msgs.len());
+            msgs[msgs.len() - back..].join(" ")
+        } else {
+            let len = 20_000 + rnd() as usize % 130_000;
+            let mut s = String::from("data:image/png;base64,");
+            s.extend((0..len).map(|_| b64[(rnd() & 63) as usize] as char));
+            s
+        };
+        out.extend_from_slice(
+            format!(
+                "{{\"type\":\"message\",\"uuid\":\"{:08x}{:08x}\",\"content\":\"",
+                rnd(),
+                rnd()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(m.as_bytes());
+        out.extend_from_slice(b"\"}\n");
+        msgs.push(if m.starts_with("data:") {
+            "image".into()
+        } else {
+            m
+        });
+    }
+    out.truncate(n);
+    out
 }
 
 // Read one extended attribute, including the hidden compression ones.
