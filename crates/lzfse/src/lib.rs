@@ -13,6 +13,7 @@
 //!
 //! The crate is `no_std` with `alloc`. The default `std` feature adds block-parallel chunk compression.
 #![no_std]
+// Unsafe code is denied everywhere except the copy kernels in `kernels`, each checked against a safe reference.
 #![deny(unsafe_code)]
 
 extern crate alloc;

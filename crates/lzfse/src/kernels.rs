@@ -71,45 +71,70 @@ pub fn copy_match(out: &mut [u8], pos: usize, d: usize, m: usize) {
 // Spare bytes the fast copies may write past the requested end; callers leave this much room.
 pub const SLACK: usize = 32;
 
-// Copy 16 bytes within `buf` from `from` to `to` through a register-sized temporary.
-#[inline(always)]
-fn move16(buf: &mut [u8], from: usize, to: usize) {
-    let mut t = [0u8; 16];
-    t.copy_from_slice(&buf[from..from + 16]);
-    buf[to..to + 16].copy_from_slice(&t);
-}
-
 // Copy `n` bytes from `src[at..]` to `dst[pos..]` in 16-byte steps, possibly writing up to 15 bytes past
-// `pos + n`; both buffers must have `SLACK` spare bytes past the copied range.
+// `pos + n`. Falls back to an exact copy if either buffer lacks the 15 spare bytes.
 #[inline(always)]
+#[allow(unsafe_code)]
 pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
+    if at + n + 15 > src.len() || pos + n + 15 > dst.len() {
+        dst[pos..pos + n].copy_from_slice(&src[at..at + n]);
+        return;
+    }
+    let (s, d) = (src[at..].as_ptr(), dst[pos..].as_mut_ptr());
     let mut c = 0;
     while c < n {
-        dst[pos + c..pos + c + 16].copy_from_slice(&src[at + c..at + c + 16]);
+        // SAFETY: the check above keeps both 16-byte ranges inside their buffers, and `src` and `dst` are distinct.
+        unsafe { core::ptr::copy_nonoverlapping(s.add(c), d.add(c), 16) };
         c += 16;
     }
 }
 
-// Like `copy_match`, but with wide steps that may write up to 15 bytes past `pos + m`; `out` must have
-// `SLACK` spare bytes past the match. The caller guarantees `1 <= d <= pos`.
+// Like `copy_match`, but with wide steps that may write up to 15 bytes past `pos + m`. Falls back to the exact
+// copy if `out` lacks the spare bytes or the distance is out of range.
 #[inline(always)]
+#[allow(unsafe_code)]
 pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
-    if d >= 16 {
+    if d < 8 || d > pos || pos + m + 15 > out.len() {
+        copy_match(out, pos, d, m);
+        return;
+    }
+    let base = out.as_mut_ptr();
+    let step = if d >= 16 { 16 } else { 8 };
+    let mut c = 0;
+    while c < m {
+        // SAFETY: both ranges lie within `out` (checked above). With `step <= d` the source range ends at or before
+        // the destination range starts, so they never overlap, and each source byte was written by an earlier step.
+        unsafe { core::ptr::copy_nonoverlapping(base.add(pos - d + c), base.add(pos + c), step) };
+        c += step;
+    }
+}
+
+// Safe reference versions of the wide copies, which the unsafe ones are tested against.
+#[cfg(test)]
+mod reference {
+    // Copy `n` bytes in 16-byte steps with checked slices.
+    pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
         let mut c = 0;
-        while c < m {
-            move16(out, pos - d + c, pos + c);
+        while c < n {
+            dst[pos + c..pos + c + 16].copy_from_slice(&src[at + c..at + c + 16]);
             c += 16;
         }
-    } else if d >= 8 {
+    }
+
+    // Copy a match in 8- or 16-byte steps with checked slices, or exactly for short distances.
+    pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
+        if d < 8 {
+            super::copy_match(out, pos, d, m);
+            return;
+        }
+        let step = if d >= 16 { 16 } else { 8 };
         let mut c = 0;
         while c < m {
-            let mut t = [0u8; 8];
-            t.copy_from_slice(&out[pos - d + c..pos - d + c + 8]);
-            out[pos + c..pos + c + 8].copy_from_slice(&t);
-            c += 8;
+            let mut t = [0u8; 16];
+            t[..step].copy_from_slice(&out[pos - d + c..pos - d + c + step]);
+            out[pos + c..pos + c + step].copy_from_slice(&t[..step]);
+            c += step;
         }
-    } else {
-        copy_match(out, pos, d, m);
     }
 }
 
@@ -132,6 +157,35 @@ mod tests {
                 assert_eq!(a, b, "d={d} m={m}");
             }
         }
+    }
+
+    // The unsafe wide copies write exactly what the safe reference versions write, slack included.
+    #[test]
+    fn unsafe_copies_match_reference() {
+        for d in 1..40 {
+            for m in 0..90 {
+                let mut a: alloc::vec::Vec<u8> =
+                    (0..200u8).chain(core::iter::repeat(0).take(200)).collect();
+                let mut b = a.clone();
+                copy_match_wild(&mut a, 200, d, m);
+                reference::copy_match_wild(&mut b, 200, d, m);
+                assert_eq!(a, b, "d={d} m={m}");
+            }
+        }
+        let src: alloc::vec::Vec<u8> = (0..120u8).collect();
+        for n in 0..90 {
+            let (mut a, mut b) = ([0u8; 120], [0u8; 120]);
+            wild_copy(&mut a, 3, &src, 5, n);
+            reference::wild_copy(&mut b, 3, &src, 5, n);
+            assert_eq!(a, b, "n={n}");
+        }
+        // Without slack the kernels fall back to exact copies and stay in bounds.
+        let mut tight = [0u8; 20];
+        wild_copy(&mut tight, 0, &src, 0, 20);
+        assert_eq!(tight[..], src[..20]);
+        let mut tight: alloc::vec::Vec<u8> = (0..30u8).collect();
+        copy_match_wild(&mut tight, 20, 10, 10);
+        assert_eq!(tight[20..], tight[10..20]);
     }
 
     // The wide copies produce the same bytes as the exact ones inside the requested range.

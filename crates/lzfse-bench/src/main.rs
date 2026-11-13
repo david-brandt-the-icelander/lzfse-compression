@@ -241,11 +241,28 @@ fn measure_ours(
         std::hint::black_box(encode_all());
     });
     let mut decoder = lzfse::Decoder::new();
-    let dec = time(runs, || {
-        for p in &packed {
-            std::hint::black_box(decoder.decode_into(p, &mut out).unwrap());
-        }
-    });
+    let dec = if threads > 1 {
+        // Each worker decodes every `threads`-th chunk with its own decoder and output buffer.
+        time(runs, || {
+            thread::scope(|sc| {
+                for t in 0..threads {
+                    let packed = &packed;
+                    sc.spawn(move || {
+                        let (mut d, mut buf) = (lzfse::Decoder::new(), vec![0u8; chunk]);
+                        for p in packed.iter().skip(t).step_by(threads) {
+                            std::hint::black_box(d.decode_into(p, &mut buf).unwrap());
+                        }
+                    });
+                }
+            })
+        })
+    } else {
+        time(runs, || {
+            for p in &packed {
+                std::hint::black_box(decoder.decode_into(p, &mut out).unwrap());
+            }
+        })
+    };
     Row {
         contender,
         input: input.name.clone(),

@@ -95,15 +95,15 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 
-    // Take the `n` most recently written bits; a refill must have made them available.
+    // Take the `n` most recently written bits; a refill must have made them available. Bits above the read
+    // position are left in the accumulator (they are never read again and refills shift them out), which keeps
+    // the accumulator off the critical path.
     #[inline(always)]
     pub fn pull(&mut self, n: u32) -> u32 {
         // Refills keep at least 56 bits and no caller pulls more than 54 between refills.
         debug_assert!(n <= 32 && n <= self.nbits);
         self.nbits -= n;
-        let value = (self.accum >> self.nbits) as u32;
-        self.accum &= (1u64 << self.nbits) - 1;
-        value
+        ((self.accum >> self.nbits) & ((1u64 << n) - 1)) as u32
     }
 }
 
