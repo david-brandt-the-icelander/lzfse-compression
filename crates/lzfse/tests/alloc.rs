@@ -2,7 +2,8 @@
 // decoders must not allocate at all, and the one-shot functions only allocate what they return plus scratch.
 // Run with `--nocapture` to see the numbers.
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
 use lzfse_zazzcat as lzfse;
@@ -14,29 +15,47 @@ static CALLS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 // Tests in this file run one at a time so their counts do not mix.
 static SERIAL: Mutex<()> = Mutex::new(());
+// Count every thread's allocations (for code that spawns threads) instead of only the measuring thread's.
+static ALL_THREADS: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    // Whether this thread is being measured; other threads (such as the test harness) are ignored.
+    static MEASURED: Cell<bool> = const { Cell::new(false) };
+}
+
+// Tell whether the current allocation should be counted.
+fn counted() -> bool {
+    ALL_THREADS.load(Relaxed) || MEASURED.try_with(Cell::get).unwrap_or(false)
+}
 
 // SAFETY: every method forwards to the system allocator unchanged.
 unsafe impl GlobalAlloc for Counting {
     // Count, then allocate.
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        CALLS.fetch_add(1, Relaxed);
-        BYTES.fetch_add(l.size(), Relaxed);
+        if counted() {
+            CALLS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(l.size(), Relaxed);
+        }
         // SAFETY: forwarded unchanged.
         unsafe { System.alloc(l) }
     }
 
     // Count, then allocate zeroed memory.
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        CALLS.fetch_add(1, Relaxed);
-        BYTES.fetch_add(l.size(), Relaxed);
+        if counted() {
+            CALLS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(l.size(), Relaxed);
+        }
         // SAFETY: forwarded unchanged.
         unsafe { System.alloc_zeroed(l) }
     }
 
     // Count a reallocation as one allocation of the new size.
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        CALLS.fetch_add(1, Relaxed);
-        BYTES.fetch_add(n, Relaxed);
+        if counted() {
+            CALLS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(n, Relaxed);
+        }
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(p, l, n) }
     }
@@ -51,11 +70,21 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-// Run `f` and return (allocations, bytes requested) it made.
+// Run `f` and return the (allocations, bytes requested) it made on this thread.
 fn count(f: impl FnOnce()) -> (usize, usize) {
     let (c, b) = (CALLS.load(Relaxed), BYTES.load(Relaxed));
+    MEASURED.with(|m| m.set(true));
     f();
+    MEASURED.with(|m| m.set(false));
     (CALLS.load(Relaxed) - c, BYTES.load(Relaxed) - b)
+}
+
+// Run `f` and return the (allocations, bytes requested) made on any thread meanwhile.
+fn count_all_threads(f: impl FnOnce()) -> (usize, usize) {
+    ALL_THREADS.store(true, Relaxed);
+    let r = count(f);
+    ALL_THREADS.store(false, Relaxed);
+    r
 }
 
 // Text-like input of `n` bytes.
@@ -145,7 +174,7 @@ fn chunk_outputs_are_exact() {
     let big = text(4 << 20);
     let mut parts = Vec::new();
     let threads = 4;
-    let c = count(|| {
+    let c = count_all_threads(|| {
         parts = lzfse::encode_chunks_with(&big, 65_536, threads, &lzfse::Options::default())
     });
     println!("encode_chunks 4 MiB in 64 KiB chunks: {c:?}");
