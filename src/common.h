@@ -19,6 +19,14 @@
 #define NOINLINE __attribute__((noinline))
 // Mark a function as rarely called, so the compiler moves it (and the code that calls it) out of hot paths.
 #define COLD __attribute__((cold, noinline))
+// Calling convention for a rarely called function that a hot loop calls: the callee saves almost every register,
+// so the loop keeps its state in registers across the call. Only Clang on 64-bit Arm and x86-64 supports it (GCC
+// lacks it, and Clang rejects it on other targets), so elsewhere this expands to nothing.
+#if defined(__clang__) && (defined(__aarch64__) || defined(__x86_64__))
+#define PRESERVE_REGISTERS __attribute__((preserve_most))
+#else
+#define PRESERVE_REGISTERS
+#endif
 // Branch hints: the condition is almost always true (LIKELY) or false (UNLIKELY).
 #define LIKELY(condition)   __builtin_expect(!!(condition), 1)
 #define UNLIKELY(condition) __builtin_expect(!!(condition), 0)

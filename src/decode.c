@@ -107,9 +107,11 @@ static NOINLINE lzfse_zazzcat_status decode_literals(lzfse_zazzcat_decoder *d, c
 
 // Execute a token the fast path declined: check its literal count and distance, then copy exactly. Kept out of
 // line: it is rarely taken, and keeping its calls out of the hot loop keeps the decoder's state in registers.
-static COLD lzfse_zazzcat_status decode_token_slow(uint8_t *output, size_t output_capacity, size_t position,
-                                                   const uint8_t *literals, size_t literals_available,
-                                                   size_t literal_length, size_t distance, size_t length) {
+// PRESERVE_REGISTERS makes this function save the registers it uses, so the loop need not spill around the call.
+static COLD PRESERVE_REGISTERS lzfse_zazzcat_status decode_token_slow(uint8_t *output, size_t output_capacity,
+                                                                      size_t position, const uint8_t *literals,
+                                                                      size_t literals_available, size_t literal_length,
+                                                                      size_t distance, size_t length) {
     if (literal_length > literals_available) return LZFSE_ZAZZCAT_CORRUPT;
     size_t match_start = position + literal_length;
     if (distance == 0 || distance > match_start) return LZFSE_ZAZZCAT_CORRUPT;

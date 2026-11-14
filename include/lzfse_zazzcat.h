@@ -148,7 +148,9 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t sour
 // Append `source` compressed as a raw LZVN payload (ending with the end-of-stream opcode) to `output`.
 lzfse_zazzcat_status lzfse_zazzcat_lzvn_encode(const void *source, size_t source_length, lzfse_zazzcat_buffer *output);
 
-// Decode a raw LZVN payload into `destination` and store the number of bytes written in `*decoded_length`.
+// Decode a raw LZVN payload into `destination[0 .. destination_capacity)` and store the number of bytes written in
+// `*decoded_length`. Like lzfse_zazzcat_decoder_decode, this may overwrite bytes past the decoded length (it uses
+// wide copies when there is room); their contents are unspecified.
 lzfse_zazzcat_status lzfse_zazzcat_lzvn_decode(const void *source, size_t source_length, void *destination,
                                                size_t destination_capacity, size_t *decoded_length);
 
