@@ -23,6 +23,25 @@ files = {
 }
 for n in [1, 7, 8, 100, 4095, 4096, 4097, 65536, 1000000]:
     files[f"text{n}"] = text[:n]
+# Session-log-like data: messages that re-send earlier context and re-read files (long-range repeats), with and
+# without large base64 attachments.
+import base64, json
+vocab = "the quick brown fox jumps over a lazy dog and of to in is it that for on with as was at by".split()
+def wds(n): return " ".join(r.choice(vocab) for _ in range(n))
+for name, blobs in [("session", False), ("session-b64", True)]:
+    msgs, out, size = [], [], 0
+    docs = [wds(r.randint(200, 2000)) for _ in range(30)]
+    while size < 4_000_000:
+        k = r.random()
+        if k < 0.45: m = wds(r.randint(20, 200))
+        elif k < 0.7: m = r.choice(docs)
+        elif k < 0.95 or not blobs: m = " ".join(msgs[-r.randint(1, min(10, len(msgs) or 1)):]) if msgs else wds(50)
+        else: m = "data:image/png;base64," + base64.b64encode(os.urandom(r.randint(20000, 150000))).decode()
+        msgs.append(wds(10) if m.startswith("data:") else m)
+        line = json.dumps({"type": "message", "uuid": "%032x" % r.getrandbits(128), "content": m}) + "\n"
+        out.append(line)
+        size += len(line)
+    files[name] = "".join(out).encode()
 for name, data in files.items():
     open(os.path.join(d, name), "wb").write(data)
 PY

@@ -27,6 +27,7 @@ Non-goals for now:
 
 - **Sources:** the format is implemented from public descriptions and from black-box testing against Apple's `libcompression` and the BSD reference ([lzfse/lzfse](https://github.com/lzfse/lzfse)).
 - **No ported code:** no reference code is copied or translated line by line. We may consult the reference source as documentation of the format, for example to confirm a constant or a header field, and record that in commit messages.
+- **Design ideas:** since 2026-11-14 (owner's decision), the reference encoder's design may also be studied. Ideas are not covered by its BSD-3-Clause license; copied or translated code would be, so we still write our own. So far this means the deferred ("pending") match and indexing every position, as described in M. Hron, *Compression method LZFSE*, CTU Prague 2018, section 4.1.1.
 - **Licensing:** the BSD-3 reference may be built in tests and benchmarks as a comparison target. It is never linked into the library.
 
 ## 3. Format notes
@@ -170,7 +171,7 @@ docs/            this design, benchmark reports
 | `bits` | Forward and backward bit writers and readers |
 | `fse` | Normalising frequency tables, building encode and decode tables, encoding and decoding |
 | `lzvn` | LZVN encoder and decoder |
-| `matchfind` | Hash-chain match finder, which has the most tuning knobs |
+| `encode` | Match finder: two hash tables (section 4.2.1), lazy evaluation, skip-ahead; `encode::block` collects tokens and entropy-codes each block |
 | `block` | One LZFSE block: tokenise, then entropy-code, or the reverse |
 | `stream` | Splitting into blocks, choosing the block type, the end marker, the public API |
 | `parallel` | Block-parallel compression of independent chunks (decmpfs-style) |
@@ -181,6 +182,66 @@ docs/            this design, benchmark reports
 - A streaming encoder and decoder.
 - `compress_chunks(input, chunk_size, threads)` for decmpfs-style independent 64 KiB blocks.
 - Every decode path enforces an explicit output-size limit.
+
+#### 4.2.1 Match finder
+
+Two tables are probed at every position, after the previous distance:
+- **Short table:** 4-way buckets keyed on 4 bytes. It finds the short matches binaries and source code live on.
+- **Long table:** one position per slot, keyed on 8 bytes, with four times as many slots.
+
+Common short strings (frequent words, JSON keys) refill the short buckets constantly. They push out the one
+candidate that starts a long repeat, so with the short table alone the encoder settled for many 10–15-byte matches.
+The long table keeps those starts.
+
+**Held-back match.** The parser holds the last match back instead of emitting it at once. If the next match extends
+backward over all of it, the held one is dropped: one token instead of two. This is the common case in JSON logs,
+where a short match on a shared prefix (`{"parentUuid":"`) is followed by a long copy that includes the prefix. The
+reference encoder keeps a pending match for the same reason.
+
+**Indexing inside matches.** Every position inside a match goes into the long table. Inside matches longer than 64
+bytes, only the first and last 16 positions also go into the short table, so that long copies do not flush its
+buckets. Content that repeats later in edited form (successive versions of a file in a session log) is then found
+again right after each edit, at its nearest earlier copy.
+
+On the owner's 552 MB Claude Code session log (M3 Pro, `lzfse-bench --stats`), Apple stores 0.1784 at 1 MiB chunks
+and 0.1604 whole:
+
+| Encoder | 1 MiB chunks | Whole |
+|---|---:|---:|
+| Both tables | 0.1854 | 0.1722 |
+| Plus the held-back match | 0.1837 | 0.1704 |
+| Plus indexing inside matches (shipped) | **0.1747** | **0.1567** |
+
+Tried and not shipped:
+- **Indexing interiors in the short table too:** 0.4% smaller on that log, but it flushes the short buckets.
+- **Larger tables (16 bits) with lazy matching up to 32 bytes:** another 1% smaller, for 5–20% slower encoding.
+- **Trying every position inside a short held match:** worse in both ratio and speed, because a replaced match's
+  bytes became literals.
+
+Hashing more bytes in the single table was tried first and rejected. It helped repetitive text but cost real
+binaries up to 8% of ratio, because they depend on 4–6-byte matches.
+
+Measured on a 4 MiB session-log-like input (`tests/apple.rs`, `session_like`):
+
+| Encoder | 1 MiB chunks | Whole |
+|---|---:|---:|
+| Apple's | 328,753 bytes | 289,447 bytes |
+| Short table only | 595,996 bytes | 588,593 bytes |
+| Both tables | 120,709 bytes | 89,207 bytes |
+
+On real binaries, libraries, man pages, JSON and source, the change was 0.2–3% smaller with both tables, never
+larger.
+
+**64 KiB fast path** (`encode/small.rs`). Inputs of at most 64 KiB, which covers every APFS chunk and most files,
+use their own finder:
+- **16-bit positions:** the short table is 192 KiB and the long table 32 KiB, against 512 + 256 KiB for large inputs.
+- **Cleared on each call**, so no stale-entry checks are needed.
+- **No distance-limit check:** a distance can never exceed 262,139 bytes.
+- **Sized to the input:** the tables shrink to 1/8 of that for 8 KiB and below. Each size is a separate
+  compile-time variant, because variable hash shifts cost about 8%.
+
+At 64 KiB chunks on real files it encodes 30–45% faster than the general finder, at most 0.2% larger. On 6 KB and
+20 KB inputs it is 30–50% faster.
 
 ### 4.3 Safety boundary
 

@@ -32,6 +32,8 @@ mod kernels;
 pub mod lzvn;
 #[cfg(feature = "std")]
 mod parallel;
+#[doc(hidden)]
+pub mod stats;
 
 pub use decode::{decode, decode_into, decoded_len, Decoder};
 pub use encode::{encode, encode_with, Encoder, Options, LZVN_THRESHOLD};
