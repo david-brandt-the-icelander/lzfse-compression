@@ -106,7 +106,8 @@ ALWAYS_INLINE lzfse_zazzcat_status read_u32_at(const uint8_t *source, size_t sou
 uint16_t read_frequency(uint32_t bits, uint32_t *bit_count);
 
 // Encode one frequency (the inverse of read_frequency): return the bits and store their count in `*bit_count`.
-uint32_t write_frequency(uint16_t value, uint32_t *bit_count);
+// `value` is a 16-bit frequency, taken as uint32_t so the arithmetic below stays unsigned.
+uint32_t write_frequency(uint32_t value, uint32_t *bit_count);
 
 // Check the limits the decoder relies on: counts, starting states, padding and table sums.
 lzfse_zazzcat_status block_header_validate(const block_header *header);

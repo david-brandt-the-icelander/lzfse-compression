@@ -182,39 +182,39 @@ static void emit_repeat(lzfse_zazzcat_buffer *out, size_t length) {
 // `readable` is how many bytes may be read from `literals` (to the end of the input).
 static void emit_token(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_t literal_count, size_t length,
                        size_t distance, size_t previous_distance, size_t readable) {
-    size_t inline_count = literal_count;
+    // From here on `literal_count` counts only the literals that ride along in the match opcode.
     if (literal_count > 3) {
         emit_literals(out, literals, literal_count, readable);
-        inline_count = 0;
+        literal_count = 0;
     }
-    if (distance == previous_distance && inline_count == 0) {
+    if (distance == previous_distance && literal_count == 0) {
         emit_repeat(out, length);
         return;
     }
     size_t first;
-    size_t l = inline_count;
     if (distance == previous_distance) {
-        first = min_size(length, max_short_match(l));
-        buffer_push_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | 6));
-    } else if (distance < 16384 && (length > max_short_match(l) || distance >= 1536)) {
+        first = min_size(length, max_short_match(literal_count));
+        buffer_push_reserved(out, (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 6));
+    } else if (distance < 16384 && (length > max_short_match(literal_count) || distance >= 1536)) {
         first = min_size(length, 34);
         size_t word = (distance << 2) | ((first - 3) & 3);
-        buffer_push_3_reserved(out, (uint8_t)(0xA0 | (l << 3) | ((first - 3) >> 2)), (uint8_t)word,
+        buffer_push_3_reserved(out, (uint8_t)(0xA0 | (literal_count << 3) | ((first - 3) >> 2)), (uint8_t)word,
                                (uint8_t)(word >> 8));
     } else if (distance < 1536) {
-        first = min_size(length, max_short_match(l));
-        buffer_push_2_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | (distance >> 8)), (uint8_t)distance);
+        first = min_size(length, max_short_match(literal_count));
+        buffer_push_2_reserved(out, (uint8_t)((literal_count << 6) | ((first - 3) << 3) | (distance >> 8)),
+                               (uint8_t)distance);
     } else {
-        first = min_size(length, max_short_match(l));
-        buffer_push_3_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | 7), (uint8_t)distance,
+        first = min_size(length, max_short_match(literal_count));
+        buffer_push_3_reserved(out, (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 7), (uint8_t)distance,
                                (uint8_t)(distance >> 8));
     }
-    if (inline_count > 0) {
+    if (literal_count > 0) {
         // Copy 4 bytes, a constant size the compiler turns into one load and one store, and keep 1 to 3 of them.
         // Reading 4 is safe: the match of at least 3 bytes follows the literals. The extra written bytes are
         // overwritten by the next output (at least the 8-byte end-of-stream trailer follows).
         store_u32(out->data + out->length, load_u32(literals));
-        out->length += inline_count;
+        out->length += literal_count;
     }
     emit_repeat(out, length - first);
 }

@@ -120,34 +120,33 @@ uint16_t read_frequency(uint32_t bits, uint32_t *bit_count) {
     return (uint16_t)(4 + ((bits >> 3) & 3));
 }
 
-uint32_t write_frequency(uint16_t value, uint32_t *bit_count) {
-    uint32_t v = value;
-    if (v == 0) {
+uint32_t write_frequency(uint32_t value, uint32_t *bit_count) {
+    if (value == 0) {
         *bit_count = 2;
         return 0;
     }
-    if (v == 1) {
+    if (value == 1) {
         *bit_count = 2;
         return 2;
     }
-    if (v == 2) {
+    if (value == 2) {
         *bit_count = 3;
         return 1;
     }
-    if (v == 3) {
+    if (value == 3) {
         *bit_count = 3;
         return 5;
     }
-    if (v <= 7) {
+    if (value <= 7) {
         *bit_count = 5;
-        return 3 | ((v - 4) << 3);
+        return 3 | ((value - 4) << 3);
     }
-    if (v <= 23) {
+    if (value <= 23) {
         *bit_count = 8;
-        return 7 | ((v - 8) << 4);
+        return 7 | ((value - 8) << 4);
     }
     *bit_count = 14;
-    return 15 | ((v - 24) << 4);
+    return 15 | ((value - 24) << 4);
 }
 
 lzfse_zazzcat_status parse_v2_header(const uint8_t *source, size_t source_length, block_header *h,
