@@ -96,25 +96,51 @@ void fse_encoder_table(const uint16_t *frequencies, size_t symbol_count, uint32_
     }
 }
 
-// What a decoder state does: read `bits` bits and add them to `next_state_base`.
-typedef struct decoder_state {
-    uint32_t bits;
-    uint32_t next_state_base;
-} decoder_state;
+// How the states of one symbol split into two runs. A symbol with frequency `f` owns `f` consecutive states. The
+// first `high_count` read `k` bits and their next-state bases rise by 2^k per state from `high_base`; the rest
+// read `k - 1` bits and their bases rise by 2^(k-1) from 0. Within each run the bits are the same and the base
+// grows by a fixed step, so the table builders fill each run with a loop that has no branch, which the compiler
+// turns into vector stores of several entries per step.
+typedef struct state_runs {
+    uint32_t k;
+    uint32_t high_count;
+    uint32_t high_base;
+} state_runs;
 
-// Describe decoder state `j` (counting from 0) of a symbol with frequency `f` in a table of `state_count`.
-ALWAYS_INLINE decoder_state decoder_state_for(uint32_t f, uint32_t j, uint32_t state_count) {
+// Describe the states of a symbol with frequency `f` (0 < f <= state_count) in a table of `state_count`.
+ALWAYS_INLINE state_runs state_runs_for(uint32_t f, uint32_t state_count) {
     uint32_t k = shift_for(f, state_count);
-    uint32_t first_low = ((2 * state_count) >> k) - f; // states before this read k bits, the rest k - 1
-    decoder_state d;
-    if (j < first_low) {
-        d.bits = k;
-        d.next_state_base = ((f + j) << k) - state_count;
-    } else {
-        d.bits = k - 1;
-        d.next_state_base = (j - first_low) << (k - 1);
+    state_runs runs;
+    runs.k = k;
+    // At most f: when k is 0 (f == state_count) it is exactly f, so the second run is empty and k - 1 is unused.
+    runs.high_count = ((2 * state_count) >> k) - f;
+    runs.high_base = (f << k) - state_count;
+    return runs;
+}
+
+// Write `count` literal entries for `symbol` that read `bits` bits, with next-state bases `first_base`,
+// `first_base + step`, `first_base + 2 * step` and so on. The fields are assigned one by one: the compiler then
+// writes 4 entries per vector store, which it does not do for a whole-struct assignment or a copy_bytes (memcpy).
+ALWAYS_INLINE void fill_literal_run(fse_literal_entry *entries, uint32_t count, uint32_t bits, uint32_t symbol,
+                                    uint32_t first_base, uint32_t step) {
+    for (uint32_t j = 0; j < count; j++) {
+        entries[j].bits = (uint8_t)bits;
+        entries[j].symbol = (uint8_t)symbol;
+        entries[j].next_state_base = (uint16_t)(first_base + j * step);
     }
-    return d;
+}
+
+// Write `count` value entries that read `bits` state bits plus `extra` value bits and decode to `value_base` plus
+// the value bits, with next-state bases `first_base`, `first_base + step` and so on (fields assigned one by one,
+// as in fill_literal_run).
+ALWAYS_INLINE void fill_value_run(fse_value_entry *entries, uint32_t count, uint32_t bits, uint32_t extra,
+                                  uint32_t value_base, uint32_t first_base, uint32_t step) {
+    for (uint32_t j = 0; j < count; j++) {
+        entries[j].total_bits = (uint8_t)(bits + extra);
+        entries[j].value_bits = (uint8_t)extra;
+        entries[j].next_state_base = (uint16_t)(first_base + j * step);
+        entries[j].value_base = value_base;
+    }
 }
 
 lzfse_zazzcat_status fse_literal_table(const uint16_t *frequencies, uint32_t state_count, fse_literal_entry *table) {
@@ -128,12 +154,12 @@ lzfse_zazzcat_status fse_literal_table(const uint16_t *frequencies, uint32_t sta
         uint32_t f = frequencies[symbol];
         if (f == 0) continue;
         if (offset + f > state_count) return LZFSE_ZAZZCAT_CORRUPT;
-        for (uint32_t j = 0; j < f; j++) {
-            decoder_state d = decoder_state_for(f, j, state_count);
-            fse_literal_entry *entry = &table[offset + j];
-            entry->bits = (uint8_t)d.bits;
-            entry->symbol = (uint8_t)symbol;
-            entry->next_state_base = (uint16_t)d.next_state_base;
+        state_runs runs = state_runs_for(f, state_count);
+        // The second call's shift by k - 1 only happens when its count is not zero, and then k >= 1.
+        fill_literal_run(table + offset, runs.high_count, runs.k, symbol, runs.high_base, 1u << runs.k);
+        if (runs.high_count < f) {
+            fill_literal_run(table + offset + runs.high_count, f - runs.high_count, runs.k - 1, symbol, 0,
+                             1u << (runs.k - 1));
         }
         offset += f;
     }
@@ -152,13 +178,13 @@ lzfse_zazzcat_status fse_value_table(const uint16_t *frequencies, size_t symbol_
         uint32_t f = frequencies[symbol];
         if (f == 0) continue;
         if (offset + f > state_count) return LZFSE_ZAZZCAT_CORRUPT;
-        for (uint32_t j = 0; j < f; j++) {
-            decoder_state d = decoder_state_for(f, j, state_count);
-            fse_value_entry *entry = &table[offset + j];
-            entry->total_bits = (uint8_t)(d.bits + extra_bits[symbol]);
-            entry->value_bits = extra_bits[symbol];
-            entry->next_state_base = (uint16_t)d.next_state_base;
-            entry->value_base = value_base[symbol];
+        state_runs runs = state_runs_for(f, state_count);
+        uint32_t extra = extra_bits[symbol];
+        fill_value_run(table + offset, runs.high_count, runs.k, extra, value_base[symbol], runs.high_base,
+                       1u << runs.k);
+        if (runs.high_count < f) {
+            fill_value_run(table + offset + runs.high_count, f - runs.high_count, runs.k - 1, extra, value_base[symbol],
+                           0, 1u << (runs.k - 1));
         }
         offset += f;
     }

@@ -288,6 +288,82 @@ static void test_fse_literals_round_trip(void) {
     }
 }
 
+// The decoder entry for state `j` of a symbol with frequency `f`, worked out one state at a time from the formula
+// in fse.h, to check the table builders, which fill each symbol's states in two runs.
+static void reference_decoder_state(uint32_t f, uint32_t j, uint32_t state_count, uint32_t *bits,
+                                    uint32_t *next_state_base) {
+    uint32_t k = 0;
+    while ((f << k) < state_count) k++;
+    uint32_t first_low = ((2 * state_count) >> k) - f;
+    if (j < first_low) {
+        *bits = k;
+        *next_state_base = ((f + j) << k) - state_count;
+    } else {
+        *bits = k - 1;
+        *next_state_base = (j - first_low) << (k - 1);
+    }
+}
+
+// Both decoder tables against the per-state reference: normalized skewed and flat counts, one symbol owning every
+// state (k = 0), and frequencies that sum to less than the table (the states past the sum must be zero).
+static void test_fse_decoder_tables_match_reference(void) {
+    for (int c = 0; c < 4; c++) {
+        uint32_t counts[256] = {0};
+        uint16_t literal_frequencies[256] = {0}, distance_frequencies[DISTANCE_SYMBOLS] = {0};
+        if (c == 0) {
+            for (uint32_t s = 0; s < 256; s++) counts[s] = (s * 37 + 11) % 97;
+        } else if (c == 1) {
+            counts[0] = 100000;
+            for (uint32_t s = 1; s < 41; s++) counts[s] = 1;
+        }
+        if (c < 2) {
+            fse_normalize(counts, 256, LITERAL_STATES, literal_frequencies);
+            fse_normalize(counts, DISTANCE_SYMBOLS, DISTANCE_STATES, distance_frequencies);
+        } else if (c == 2) {
+            literal_frequencies[7] = LITERAL_STATES;
+            distance_frequencies[7] = DISTANCE_STATES;
+        } else {
+            literal_frequencies[3] = 5;
+            literal_frequencies[200] = 300;
+            distance_frequencies[3] = 5;
+            distance_frequencies[60] = 100;
+        }
+        fse_literal_entry literals[LITERAL_STATES];
+        fse_value_entry values[DISTANCE_STATES];
+        REQUIRE(fse_literal_table(literal_frequencies, LITERAL_STATES, literals) == LZFSE_ZAZZCAT_OK, "literals");
+        REQUIRE(fse_value_table(distance_frequencies, DISTANCE_SYMBOLS, DISTANCE_STATES, distance_extra_bits,
+                                distance_base, values) == LZFSE_ZAZZCAT_OK,
+                "values");
+        uint32_t state = 0, bits, base;
+        for (uint32_t s = 0; s < 256; s++) {
+            for (uint32_t j = 0; j < literal_frequencies[s]; j++, state++) {
+                reference_decoder_state(literal_frequencies[s], j, LITERAL_STATES, &bits, &base);
+                CHECK(literals[state].bits == bits && literals[state].symbol == s &&
+                          literals[state].next_state_base == base,
+                      "case %d literal state %u", c, state);
+            }
+        }
+        for (; state < LITERAL_STATES; state++) {
+            CHECK(literals[state].bits == 0 && literals[state].symbol == 0 && literals[state].next_state_base == 0,
+                  "case %d unused literal state %u", c, state);
+        }
+        state = 0;
+        for (uint32_t s = 0; s < DISTANCE_SYMBOLS; s++) {
+            for (uint32_t j = 0; j < distance_frequencies[s]; j++, state++) {
+                reference_decoder_state(distance_frequencies[s], j, DISTANCE_STATES, &bits, &base);
+                CHECK(values[state].total_bits == bits + distance_extra_bits[s] &&
+                          values[state].value_bits == distance_extra_bits[s] && values[state].next_state_base == base &&
+                          values[state].value_base == distance_base[s],
+                      "case %d value state %u", c, state);
+            }
+        }
+        for (; state < DISTANCE_STATES; state++) {
+            CHECK(values[state].total_bits == 0 && values[state].next_state_base == 0 && values[state].value_base == 0,
+                  "case %d unused value state %u", c, state);
+        }
+    }
+}
+
 static void test_single_symbol_uses_no_bits(void) {
     uint16_t frequencies[4] = {0, 0, 64, 0};
     fse_encoder_entry encoder[4];
@@ -401,6 +477,28 @@ static void test_match_lengths(void) {
     CHECK(match_length(buffer, 0, 24, 32) == 8, "forward to the end");
     CHECK(match_length_backward(buffer, 8, 16, 100) == 8, "backward");
     CHECK(match_length_backward(buffer, 8, 16, 3) == 3, "backward limit");
+    // Every pair of positions and several limits against a byte-by-byte reference, in a buffer of repeats with
+    // a few changed bytes, so the 8-byte steps stop at every offset within a word and the byte tail runs too.
+    uint8_t data[96];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)("abcdefghijk"[i % 11]);
+    data[5] = 'X';
+    data[40] = 'Y';
+    data[71] = 'Z';
+    const size_t limits[] = {0, 1, 7, 8, 9, 16, 23, 100};
+    for (size_t earlier = 0; earlier < sizeof data; earlier++) {
+        for (size_t later = earlier + 1; later <= sizeof data; later++) {
+            for (size_t l = 0; l < sizeof limits / sizeof limits[0]; l++) {
+                size_t expected = 0;
+                while (expected < limits[l] && expected < earlier &&
+                       data[earlier - 1 - expected] == data[later - 1 - expected]) {
+                    expected++;
+                }
+                size_t got = match_length_backward(data, earlier, later, limits[l]);
+                CHECK(got == expected, "backward %zu %zu limit %zu: %zu, wanted %zu", earlier, later, limits[l], got,
+                      expected);
+            }
+        }
+    }
 }
 
 // Every distance 1–64 and length 0–256 against a byte-by-byte reference. copy_match_exact copies with
@@ -842,6 +940,7 @@ int main(void) {
     RUN_TEST(test_bit_reader_rejects_bad_starts);
     RUN_TEST(test_normalize_sums_exactly);
     RUN_TEST(test_fse_literals_round_trip);
+    RUN_TEST(test_fse_decoder_tables_match_reference);
     RUN_TEST(test_single_symbol_uses_no_bits);
     RUN_TEST(test_oversized_tables_are_rejected);
     RUN_TEST(test_lzvn_round_trips);
