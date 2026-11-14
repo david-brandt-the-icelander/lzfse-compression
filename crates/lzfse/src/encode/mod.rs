@@ -238,11 +238,17 @@ fn parse<F: Find>(src: &[u8], f: &mut F, blocks: &mut Blocks, opts: &Options, ou
         d_prev = m.dist;
         let end = m.start + m.len;
         // Index positions inside the match so later data can refer to them. Long matches go into the 4-byte
-        // table only at their edges, so they do not flush it, but every position goes into the long table: when
-        // this content repeats later, possibly edited, the copy right after an edit is then found here.
+        // table only at their edges, so they do not flush it. Their interior goes into the long table: when this
+        // content repeats later, possibly edited, the copy right after an edit is then found here. Runs and short
+        // periods (distance below 16) are skipped, since every position there holds the same few bytes.
+        let interior = m.dist >= 16;
         let mut j = (i + 2).max(m.start + 1);
         while j < end.min(limit) {
             if m.len > 64 && j > m.start + 16 && j + 16 < end {
+                if !interior {
+                    j = end - 16;
+                    continue;
+                }
                 f.insert_long(j);
             } else {
                 f.insert(j);
