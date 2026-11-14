@@ -37,16 +37,22 @@ ALWAYS_INLINE size_t match_length_backward(const uint8_t *buffer, size_t earlier
 // Copy `length` bytes from `distance` bytes back to `output + position`, repeating the pattern when the ranges
 // overlap (distance < length), exactly (nothing written past the end). The caller guarantees
 // 1 <= distance <= position. The pattern is copied in growing pieces, each a whole number of periods.
+//
+// No piece's source and destination overlap, so plain copy_bytes is safe and memmove's overlap handling is not
+// needed (the sanitizer build checks this). A piece of `n` bytes copies from `position - distance` to
+// `position + done`, so the two overlap only when n > distance + done. The direct call has n = length <= distance
+// and done = 0. In the loop the first piece is `distance` with done = 0; after it done >= distance, and each later
+// piece is at most `done - done % distance`, which is <= done.
 ALWAYS_INLINE void copy_match_exact(uint8_t *output, size_t position, size_t distance, size_t length) {
     if (distance >= length) {
-        move_bytes(output + position, output + position - distance, length);
+        copy_bytes(output + position, output + position - distance, length);
         return;
     }
     size_t done = 0;
     size_t piece = distance;
     while (done < length) {
         size_t n = min_size(piece, length - done);
-        move_bytes(output + position + done, output + position - distance, n);
+        copy_bytes(output + position + done, output + position - distance, n);
         done += n;
         piece = max_size(done, distance) - done % distance;
         if (piece == 0) piece = distance;

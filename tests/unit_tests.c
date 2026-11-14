@@ -403,10 +403,13 @@ static void test_match_lengths(void) {
     CHECK(match_length_backward(buffer, 8, 16, 3) == 3, "backward limit");
 }
 
+// Every distance 1–64 and length 0–256 against a byte-by-byte reference. copy_match_exact copies with
+// copy_bytes (no overlap allowed), so the sanitizer build also checks that no piece overlaps; the zeroed tail
+// checks that nothing is written past the end.
 static void test_copy_match_exact(void) {
-    for (size_t d = 1; d < 20; d++) {
-        for (size_t m = 0; m < 70; m++) {
-            uint8_t a[180] = {0}, b[180] = {0};
+    for (size_t d = 1; d <= 64; d++) {
+        for (size_t m = 0; m <= 256; m++) {
+            uint8_t a[100 + 256 + 16] = {0}, b[100 + 256 + 16] = {0};
             for (int i = 0; i < 100; i++) a[i] = b[i] = (uint8_t)i;
             copy_match_exact(a, 100, d, m);
             for (size_t i = 0; i < m; i++) b[100 + i] = b[100 + i - d];
