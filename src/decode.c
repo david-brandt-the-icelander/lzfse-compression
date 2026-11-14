@@ -251,7 +251,12 @@ lzfse_zazzcat_status lzfse_zazzcat_decode_into(const void *source, size_t source
                                                size_t destination_capacity, size_t *decoded_length) {
     // The tables (about 7 KB) live on the stack; only the literal buffer is allocated.
     lzfse_zazzcat_decoder decoder;
-    memset(&decoder, 0, sizeof decoder);
+    // Not cleared: only the literal buffer fields need a starting value. The FSE tables are rebuilt by
+    // fse_literal_table and fse_value_table for every LZFSE block before anything reads them, and streams of
+    // LZVN or uncompressed blocks never read them at all.
+    // memset(&decoder, 0, sizeof decoder);
+    decoder.literals = NULL;
+    decoder.literals_capacity = 0;
     lzfse_zazzcat_status status =
         decode_with(&decoder, source, source_length, destination, destination_capacity, decoded_length);
     zz_free(decoder.literals);

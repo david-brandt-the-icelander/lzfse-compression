@@ -125,6 +125,8 @@ static block_header sample_header(void) {
 
 static void test_headers_round_trip(void) {
     block_header h = sample_header(), back;
+    // The parsers set every field but not the struct's padding bytes, which memcmp also compares.
+    memset(&back, 0, sizeof back);
     CHECK(block_header_validate(&h) == LZFSE_ZAZZCAT_OK, "sample header is valid");
     lzfse_zazzcat_buffer v2 = {0}, v1 = {0};
     size_t size = write_v2_header(&h, &v2), parsed_size = 0;

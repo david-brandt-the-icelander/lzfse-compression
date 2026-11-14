@@ -25,7 +25,10 @@ lzfse_zazzcat_status lzfse_zazzcat_decmpfs_compress(const void *data, size_t len
     // Encode the chunks straight into the fork after room for the offset table, then fill in the table.
     lzfse_zazzcat_buffer *fork = &result->fork;
     if (!buffer_reserve(fork, table_size)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-    memset(fork->data, 0, table_size);
+    // Not cleared: lzfse_zazzcat_encode_chunks always returns chunk_count + 1 offsets, and the resource-fork
+    // path below stores every one of them, filling all table_size bytes. The inline path sets fork->length to 0,
+    // so the table is dropped. On failure the fork is freed.
+    // memset(fork->data, 0, table_size);
     fork->length = table_size;
     lzfse_zazzcat_offsets offsets = {NULL, 0, 0};
     lzfse_zazzcat_status status =

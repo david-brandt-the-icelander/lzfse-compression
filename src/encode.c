@@ -232,7 +232,9 @@ lzfse_zazzcat_status lzfse_zazzcat_encoder_encode(lzfse_zazzcat_encoder *e, cons
     } else if (length < LZFSE_ZAZZCAT_LZVN_THRESHOLD) {
         // Small inputs: one LZVN block, or a raw block if LZVN does not make it smaller.
         if (!buffer_reserve(output, LZVN_HEADER_SIZE)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-        memset(output->data + mark, 0, LZVN_HEADER_SIZE);
+        // Not cleared: this placeholder is reserved space. On success the three store_u32 calls below overwrite
+        // all 12 bytes; otherwise output->length goes back to `mark` and the placeholder is dropped.
+        // memset(output->data + mark, 0, LZVN_HEADER_SIZE);
         output->length += LZVN_HEADER_SIZE;
         status = lzvn_encode_with_table(source, length, output, &e->lzvn_table);
         size_t payload = output->length - mark - LZVN_HEADER_SIZE;

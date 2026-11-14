@@ -25,15 +25,23 @@ static int compare_remainders(const void *a, const void *b) {
 void fse_normalize(const uint32_t *counts, size_t symbol_count, uint32_t state_count, uint16_t *frequencies) {
     uint64_t total = 0;
     for (size_t i = 0; i < symbol_count; i++) total += counts[i];
-    memset(frequencies, 0, symbol_count * sizeof *frequencies);
-    if (total == 0) return;
+    // Not cleared up front: the loop below writes every entry (0 for unused symbols), and an empty input gets
+    // its zeros here, so no entry is left unset.
+    // memset(frequencies, 0, symbol_count * sizeof *frequencies);
+    if (total == 0) {
+        for (size_t i = 0; i < symbol_count; i++) frequencies[i] = 0;
+        return;
+    }
     // Largest-remainder rounding: give every used symbol the floor of its share (at least 1), then hand the
     // leftover states to the largest remainders.
     remainder_entry remainders[256];
     size_t used = 0;
     uint32_t assigned = 0;
     for (size_t i = 0; i < symbol_count; i++) {
-        if (counts[i] == 0) continue;
+        if (counts[i] == 0) {
+            frequencies[i] = 0;
+            continue;
+        }
         uint64_t scaled = (uint64_t)counts[i] * state_count;
         uint32_t share = (uint32_t)(scaled / total);
         if (share < 1) share = 1;
@@ -72,7 +80,9 @@ void fse_encoder_table(const uint16_t *frequencies, size_t symbol_count, uint32_
     for (size_t s = 0; s < symbol_count; s++) {
         uint32_t f = frequencies[s];
         if (f == 0) {
-            memset(&table[s], 0, sizeof table[s]);
+            // Not cleared: a symbol with frequency 0 never occurs in the block, so the encoder never looks up
+            // its entry.
+            // memset(&table[s], 0, sizeof table[s]);
             continue;
         }
         uint32_t k = shift_for(f, state_count);
@@ -108,7 +118,11 @@ ALWAYS_INLINE decoder_state decoder_state_for(uint32_t f, uint32_t j, uint32_t s
 }
 
 lzfse_zazzcat_status fse_literal_table(const uint16_t *frequencies, uint32_t state_count, fse_literal_entry *table) {
-    memset(table, 0, state_count * sizeof *table);
+    // Not cleared up front: the loop below writes every state from 0 up to the sum of the frequencies, and only
+    // the states past that sum are cleared at the end. Untrusted streams may have frequencies that sum to less
+    // than state_count, and the decoder can still reach those states, so they must hold a defined (zero) entry.
+    // A table left half-built by a CORRUPT return is never used.
+    // memset(table, 0, state_count * sizeof *table);
     uint32_t offset = 0;
     for (uint32_t symbol = 0; symbol < LITERAL_SYMBOLS; symbol++) {
         uint32_t f = frequencies[symbol];
@@ -123,12 +137,16 @@ lzfse_zazzcat_status fse_literal_table(const uint16_t *frequencies, uint32_t sta
         }
         offset += f;
     }
+    // States the frequencies did not cover (none for well-formed streams, whose frequencies sum to state_count).
+    memset(table + offset, 0, (state_count - offset) * sizeof *table);
     return LZFSE_ZAZZCAT_OK;
 }
 
 lzfse_zazzcat_status fse_value_table(const uint16_t *frequencies, size_t symbol_count, uint32_t state_count,
                                      const uint8_t *extra_bits, const uint32_t *value_base, fse_value_entry *table) {
-    memset(table, 0, state_count * sizeof *table);
+    // Not cleared up front, for the same reason as in fse_literal_table: every state up to the sum of the
+    // frequencies is written below, and only the states past it are cleared at the end.
+    // memset(table, 0, state_count * sizeof *table);
     uint32_t offset = 0;
     for (size_t symbol = 0; symbol < symbol_count; symbol++) {
         uint32_t f = frequencies[symbol];
@@ -144,5 +162,7 @@ lzfse_zazzcat_status fse_value_table(const uint16_t *frequencies, size_t symbol_
         }
         offset += f;
     }
+    // States the frequencies did not cover (none for well-formed streams, whose frequencies sum to state_count).
+    memset(table + offset, 0, (state_count - offset) * sizeof *table);
     return LZFSE_ZAZZCAT_OK;
 }

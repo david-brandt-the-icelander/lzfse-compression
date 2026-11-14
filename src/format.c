@@ -61,7 +61,9 @@ lzfse_zazzcat_status block_header_validate(const block_header *h) {
 lzfse_zazzcat_status parse_v1_header(const uint8_t *source, size_t source_length, block_header *h,
                                      size_t *header_size) {
     if (source_length < V1_HEADER_SIZE) return LZFSE_ZAZZCAT_TRUNCATED;
-    memset(h, 0, sizeof *h);
+    // Not cleared: every field, including all four frequency tables, is read from the header below. Callers use
+    // `h` only when this returns OK.
+    // memset(h, 0, sizeof *h);
     h->decoded_size = load_u32(source + 4);
     uint32_t payload_size = load_u32(source + 8);
     h->literal_count = load_u32(source + 12);
@@ -154,7 +156,10 @@ lzfse_zazzcat_status parse_v2_header(const uint8_t *source, size_t source_length
     size_t size = bit_field(word2, 0, 32);
     if (size < V2_FIXED_HEADER_SIZE) return LZFSE_ZAZZCAT_CORRUPT;
     if (size > source_length) return LZFSE_ZAZZCAT_TRUNCATED;
-    memset(h, 0, sizeof *h);
+    // Not cleared: every scalar field is read from the fixed header below, and the frequency loop sets every
+    // frequency. Only a header without tables leaves the frequencies unset, so that case zeroes them itself.
+    // Callers use `h` only when this returns OK.
+    // memset(h, 0, sizeof *h);
     h->decoded_size = load_u32(source + 4);
     h->literal_count = bit_field(word0, 0, 20);
     h->literal_payload_size = bit_field(word0, 20, 20);
@@ -170,11 +175,14 @@ lzfse_zazzcat_status parse_v2_header(const uint8_t *source, size_t source_length
     // A header without tables leaves every frequency at zero.
     const uint8_t *tables_start = source + V2_FIXED_HEADER_SIZE;
     size_t tables_length = size - V2_FIXED_HEADER_SIZE;
-    if (tables_length == 0) return LZFSE_ZAZZCAT_OK;
+    frequency_tables tables = frequency_tables_of(h);
+    if (tables_length == 0) {
+        for (int t = 0; t < 4; t++) memset(tables.table[t], 0, tables.count[t] * sizeof *tables.table[t]);
+        return LZFSE_ZAZZCAT_OK;
+    }
     // Read the variable-length frequency codes through a 32-bit accumulator, least significant bits first.
     uint32_t accumulator = 0, available_bits = 0;
     size_t next_byte = 0;
-    frequency_tables tables = frequency_tables_of(h);
     for (int t = 0; t < 4; t++) {
         for (size_t i = 0; i < tables.count[t]; i++) {
             while (next_byte < tables_length && available_bits + 8 <= 32) {
@@ -197,7 +205,9 @@ size_t write_v2_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     // At most 14 bits per frequency, plus the fixed fields.
     if (!buffer_reserve(output, V2_FIXED_HEADER_SIZE + FREQUENCY_COUNT * 14 / 8 + 2)) return 0;
     size_t start = output->length;
-    memset(output->data + start, 0, V2_FIXED_HEADER_SIZE);
+    // Not cleared: this placeholder is reserved space, and write_v2_fixed_fields below overwrites all 32 bytes
+    // (magic, decoded size and three 64-bit words) before the header is returned.
+    // memset(output->data + start, 0, V2_FIXED_HEADER_SIZE);
     output->length += V2_FIXED_HEADER_SIZE;
     uint32_t accumulator = 0, pending_bits = 0;
     frequency_tables tables = frequency_tables_of(h);
