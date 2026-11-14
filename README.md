@@ -26,27 +26,26 @@ the Rust one.
 ## Why it is faster
 
 Measured against `libcompression` in the same process on the owner's M1 Pro (10 threads). The full tables and
-method are in [`docs/benchmarks`](docs/benchmarks/2026-11-14-owner-m1-pro-c.md).
+method are in [`docs/benchmarks`](docs/benchmarks/2026-11-14-owner-m1-pro-main.md); the session-log numbers come from
+the [previous run](docs/benchmarks/2026-11-14-owner-m1-pro-c.md).
 
 - **Every core.** `encode_chunks` compresses independent chunks on all cores, which is how APFS stores files
   (64 KiB chunks). The chunks are separate streams, so they decode in parallel too. Apple's API is
-  single-threaded. On a real Claude Code session log, we encode 7.6–8.3× faster than Apple's and decode 5.6–5.9×
-  faster.
-- **Faster on one core too.** On that same log, single-threaded encoding is 18–37% faster and decoding is on par,
-  with output as small or up to 1% smaller. Plain text encodes 56–68% faster, decodes 6–12% faster, and comes out
-  9–10% smaller. Binaries encode 2–15% faster and come out 2–3% smaller.
+  single-threaded. On plain text, 10 threads encode 9.5–10.9× faster than Apple's and decode 5.4–7.5× faster; on a
+  real Claude Code session log, 7.6–8.3× and 5.6–5.9×.
+- **Faster on one core too.** Every input encodes and decodes faster than with Apple's code:
+  - plain text encodes 56–67% faster, decodes 17–25% faster, and comes out 8–10% smaller;
+  - binaries encode 6–13% faster, decode 2–7% faster, and come out 2–3% smaller;
+  - the session log encodes 18–37% faster and decodes on par, with output as small or up to 1% smaller.
 - **Long repeats are found.** A second match-finder table keyed on 8 bytes keeps track of where long repeats
   start. On logs that re-send long earlier context, the output is up to 69% smaller than Apple's.
 - **Incompressible data is stored, not coded.** Blocks that do not shrink become raw blocks:
-  - media and already-compressed files decode 50–62× faster than Apple's;
+  - media and already-compressed files decode 66–75× faster than Apple's, because decoding a raw block is a copy;
   - they encode 2.1–2.3× faster;
   - and they end up 1% smaller.
 - **Cheap where Apple is expensive.**
-  - Long runs (zeros, padding) encode 36–153× faster.
+  - Long runs (zeros, padding) encode 38–156× faster.
   - JSON with base64 attachments encodes 1.4–2.3× faster and decodes 6–7% faster.
-
-Single-threaded binary decoding is where Apple's code still wins, by 1–5%, even though our output is 2–3% smaller.
-Closing that gap is the current work (see [`docs/DESIGN.md`](docs/DESIGN.md), section 5).
 
 ## What is in the box
 

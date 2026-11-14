@@ -159,9 +159,23 @@ instruction counts disagree on a tiny workload, believe the counts.
   code.
 - **Count instructions when timings are tiny or noisy.** They separate real changes from scheduler noise.
 
+## Update, that evening
+
+The owner ran the benchmark on the M1 Pro with everything merged ([report](../docs/benchmarks/2026-11-14-owner-m1-pro-main.md)).
+Apple's own speeds matched the Rust-era run within 1–3%, so this time the absolute numbers compare directly.
+
+- **The parallel regression is gone.** Parallel encoding is 1.1–2.0× the first C run's and level with or ahead of
+  Rust's, with the biggest gains on JSON + base64 and noise, the inputs that write the most output. That is what the
+  false-sharing fix predicted.
+- **The parallel decode gap was never in the decoder.** Parallel decoding recovered to 0.99–1.36× Rust's with no
+  decoder change of note. The earlier low rows came from that run's conditions and from core placement.
+- **Binary decoding now beats Apple's,** by 2–7% (it was 1–5% behind), and text decoding is 17–25% ahead. Part of
+  that is run conditions; whether the rest holds needs a repeat run.
+
+On the owner's M1 Pro, every input now encodes and decodes faster than with Apple's code, on one core and on ten.
+
 ## Still open
 
-- The owner's paired C/Rust run on the M1, to see how much of the parallel gap the false-sharing fix closed and
-  whether the parallel decode gap is real.
-- Single-threaded binary decoding, 1–5% behind Apple.
+- A repeat run on the M1, to confirm the single-threaded decode gains.
+- JSON + base64 decoding, which still trails the Rust version slightly relative to Apple (1.06–1.07× against 1.10×).
 - Wiring the decmpfs writer into `free-disk-space`.
