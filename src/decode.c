@@ -17,7 +17,13 @@ struct lzfse_zazzcat_decoder {
 };
 
 lzfse_zazzcat_decoder *lzfse_zazzcat_decoder_create(void) {
-    return zz_calloc(1, sizeof(lzfse_zazzcat_decoder));
+    // Not zeroed: as in lzfse_zazzcat_decode_into, only the literal buffer fields need a starting value. The FSE
+    // tables are rebuilt for every LZFSE block before anything reads them.
+    lzfse_zazzcat_decoder *decoder = zz_malloc(sizeof *decoder);
+    if (decoder == NULL) return NULL;
+    decoder->literals = NULL;
+    decoder->literals_capacity = 0;
+    return decoder;
 }
 
 void lzfse_zazzcat_decoder_destroy(lzfse_zazzcat_decoder *decoder) {
@@ -85,7 +91,7 @@ static NOINLINE lzfse_zazzcat_status decode_literals(lzfse_zazzcat_decoder *d, c
         d->literals = grown;
         d->literals_capacity = count + COPY_SLACK;
     }
-    bit_reader reader = {0};
+    bit_reader reader; // bit_reader_init sets every field when it succeeds
     if ((status = bit_reader_init(&reader, source, source_length, h->literal_padding_bits))) return status;
     const fse_literal_entry *table = d->literal_table;
     uint32_t state0 = h->literal_states[0], state1 = h->literal_states[1];
@@ -142,7 +148,7 @@ static NOINLINE lzfse_zazzcat_status decode_tokens(lzfse_zazzcat_decoder *d, con
                                   distance_base, d->value_tables + LITERAL_LENGTH_STATES + MATCH_LENGTH_STATES))) {
         return status;
     }
-    bit_reader reader = {0};
+    bit_reader reader; // bit_reader_init sets every field when it succeeds
     if ((status = bit_reader_init(&reader, token_stream, token_stream_length, h->token_padding_bits))) {
         return status;
     }

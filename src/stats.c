@@ -78,7 +78,7 @@ lzfse_zazzcat_status lzfse_zazzcat_stream_stats_add(lzfse_zazzcat_stream_stats *
                                           distance_extra_bits, distance_base, d_table))) {
                 break;
             }
-            bit_reader reader = {0};
+            bit_reader reader; // bit_reader_init sets every field when it succeeds
             if ((status = bit_reader_init(&reader, src + token_start, h.token_payload_size, h.token_padding_bits))) {
                 break;
             }

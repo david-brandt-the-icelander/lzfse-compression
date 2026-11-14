@@ -249,7 +249,8 @@ void write_v2_fixed_fields(const block_header *h, uint32_t header_size, uint8_t 
 bool write_v1_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     if (!buffer_reserve(output, V1_HEADER_SIZE)) return false;
     uint8_t *out = output->data + output->length;
-    clear_bytes(out, V1_HEADER_SIZE);
+    // Not cleared: the stores below write bytes 0 to 769, and the 2 padding bytes at the end are zeroed last.
+    // clear_bytes(out, V1_HEADER_SIZE);
     uint32_t fields[8] = {MAGIC_LZFSE_V1,
                           h->decoded_size,
                           h->literal_payload_size + h->token_payload_size,
@@ -267,6 +268,8 @@ bool write_v1_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     for (int t = 0; t < 4; t++) {
         for (size_t i = 0; i < tables.count[t]; i++, offset += 2) store_u16(out + offset, tables.table[t][i]);
     }
+    // The header struct's trailing padding (offset 770 here) rounds its size up to a multiple of 4.
+    store_u16(out + offset, 0);
     output->length += V1_HEADER_SIZE;
     return true;
 }
