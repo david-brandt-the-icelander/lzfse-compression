@@ -11,23 +11,78 @@
 #define MAX_LZVN_DISTANCE    0xFFFF
 #define MAX_HASH_BITS        14
 
-// Opcodes that are reserved (undefined) and must be rejected.
-static bool is_undefined_opcode(uint8_t op) {
-    return op == 0x1E || op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E || (op >= 0x70 && op <= 0x7F) ||
-           (op >= 0xD0 && op <= 0xDF);
-}
+// The kinds of LZVN opcode. Each opcode byte belongs to exactly one kind (see opcode_kinds), which fixes how many
+// bytes the opcode takes and where its literal length, match length and distance come from.
+typedef enum lzvn_kind {
+    // 0-3 literals, match length 3-10, distance in 11 bits (2 bytes).
+    SMALL_DISTANCE,
+    // 0-3 literals, match length 3-34, distance in 14 bits (3 bytes).
+    MEDIUM_DISTANCE,
+    // 0-3 literals, match length 3-10, distance in 16 bits (3 bytes).
+    LARGE_DISTANCE,
+    // 1-3 literals, match length 3-10, the previous distance (1 byte).
+    PREVIOUS_DISTANCE,
+    // Match length 1-15 at the previous distance (1 byte), or 16 + the next byte (2 bytes).
+    SMALL_MATCH,
+    LARGE_MATCH,
+    // 1-15 literals (1 byte), or 16 + the next byte (2 bytes).
+    SMALL_LITERALS,
+    LARGE_LITERALS,
+    // Does nothing (1 byte).
+    NOP,
+    // Ends the stream (8 bytes).
+    END_OF_STREAM,
+    // Reserved: the stream is corrupt.
+    UNDEFINED,
+} lzvn_kind;
 
-// What one opcode asks for. `distance` is NO_MATCH for literal-only opcodes and REUSE_DISTANCE for "the previous
-// distance".
-typedef struct lzvn_opcode {
-    size_t opcode_length;
-    size_t literal_length;
-    size_t match_length;
-    size_t distance;
-} lzvn_opcode;
+// Shorthands for the table below.
+#define S_ SMALL_DISTANCE
+#define M_ MEDIUM_DISTANCE
+#define L_ LARGE_DISTANCE
+#define P_ PREVIOUS_DISTANCE
+#define U_ UNDEFINED
+#define SL SMALL_LITERALS
+#define LL LARGE_LITERALS
+#define SM SMALL_MATCH
+#define LM LARGE_MATCH
+// The usual pattern of 8 opcodes: the low 3 bits 0-5 give a small distance, 6 the previous one, 7 a large one.
+#define EIGHT S_, S_, S_, S_, S_, S_, P_, L_
 
-#define NO_MATCH       SIZE_MAX
-#define REUSE_DISTANCE (SIZE_MAX - 1)
+// The kind of each opcode byte, one row of 16 per value of the high 4 bits. Looking the kind up in a table and
+// switching on it takes a few instructions per opcode, where testing the byte against each range in turn took
+// dozens.
+// clang-format off
+static const uint8_t opcode_kinds[256] = {
+    S_, S_, S_, S_, S_, S_, END_OF_STREAM, L_, S_, S_, S_, S_, S_, S_, NOP, L_, // 0x00: no literals
+    S_, S_, S_, S_, S_, S_, NOP, L_, S_, S_, S_, S_, S_, S_, U_, L_,            // 0x10
+    S_, S_, S_, S_, S_, S_, U_, L_, S_, S_, S_, S_, S_, S_, U_, L_,             // 0x20
+    S_, S_, S_, S_, S_, S_, U_, L_, S_, S_, S_, S_, S_, S_, U_, L_,             // 0x30
+    EIGHT, EIGHT,                                                               // 0x40: 1 literal
+    EIGHT, EIGHT,                                                               // 0x50
+    EIGHT, EIGHT,                                                               // 0x60
+    U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_,             // 0x70: reserved
+    EIGHT, EIGHT,                                                               // 0x80: 2 literals
+    EIGHT, EIGHT,                                                               // 0x90
+    M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_,             // 0xA0: medium distance
+    M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_, M_,             // 0xB0
+    EIGHT, EIGHT,                                                               // 0xC0: 3 literals
+    U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_, U_,             // 0xD0: reserved
+    LL, SL, SL, SL, SL, SL, SL, SL, SL, SL, SL, SL, SL, SL, SL, SL,             // 0xE0: literals only
+    LM, SM, SM, SM, SM, SM, SM, SM, SM, SM, SM, SM, SM, SM, SM, SM,             // 0xF0: previous distance
+};
+// clang-format on
+
+#undef S_
+#undef M_
+#undef L_
+#undef P_
+#undef U_
+#undef SL
+#undef LL
+#undef SM
+#undef LM
+#undef EIGHT
 
 // Run opcodes from `source` into `output` starting at `position` until end-of-stream. Store the number of source
 // bytes used and the output end position.
@@ -38,82 +93,105 @@ static lzfse_zazzcat_status decode_run(const uint8_t *source, size_t source_leng
     size_t previous_distance = 0;
     for (;;) {
         if (at >= source_length) return LZFSE_ZAZZCAT_TRUNCATED;
-        uint8_t op = source[at];
+        const uint8_t *opcode = source + at;
+        size_t op = opcode[0];
         size_t available = source_length - at;
-        lzvn_opcode o = {1, 0, 0, NO_MATCH};
-        if (op == END_OF_STREAM_OPCODE) {
-            // End of stream: the opcode plus 7 zero bytes.
+        // A literal-only opcode has match length 0; its distance (1) is never used.
+        size_t opcode_length, literal_length, match_length, distance;
+        switch ((lzvn_kind)opcode_kinds[op]) {
+        case SMALL_DISTANCE:
+            if (available < 2) return LZFSE_ZAZZCAT_TRUNCATED;
+            opcode_length = 2;
+            literal_length = op >> 6;
+            match_length = ((op >> 3) & 7) + 3;
+            distance = ((op & 7) << 8) | opcode[1];
+            break;
+        case MEDIUM_DISTANCE: {
+            if (available < 3) return LZFSE_ZAZZCAT_TRUNCATED;
+            size_t word = load_u16(opcode + 1);
+            opcode_length = 3;
+            literal_length = (op >> 3) & 3;
+            match_length = (((op & 7) << 2) | (word & 3)) + 3;
+            distance = word >> 2;
+            break;
+        }
+        case LARGE_DISTANCE:
+            if (available < 3) return LZFSE_ZAZZCAT_TRUNCATED;
+            opcode_length = 3;
+            literal_length = op >> 6;
+            match_length = ((op >> 3) & 7) + 3;
+            distance = load_u16(opcode + 1);
+            break;
+        case PREVIOUS_DISTANCE:
+            opcode_length = 1;
+            literal_length = op >> 6;
+            match_length = ((op >> 3) & 7) + 3;
+            distance = previous_distance;
+            break;
+        case SMALL_MATCH:
+            opcode_length = 1;
+            literal_length = 0;
+            match_length = op & 0x0F;
+            distance = previous_distance;
+            break;
+        case LARGE_MATCH:
+            if (available < 2) return LZFSE_ZAZZCAT_TRUNCATED;
+            opcode_length = 2;
+            literal_length = 0;
+            match_length = 16 + (size_t)opcode[1];
+            distance = previous_distance;
+            break;
+        case SMALL_LITERALS:
+            opcode_length = 1;
+            literal_length = op & 0x0F;
+            match_length = 0;
+            distance = 1;
+            break;
+        case LARGE_LITERALS:
+            if (available < 2) return LZFSE_ZAZZCAT_TRUNCATED;
+            opcode_length = 2;
+            literal_length = 16 + (size_t)opcode[1];
+            match_length = 0;
+            distance = 1;
+            break;
+        case NOP:
+            at += 1;
+            continue;
+        case END_OF_STREAM:
+            // The opcode plus 7 zero bytes.
             if (available < 8) return LZFSE_ZAZZCAT_TRUNCATED;
             *bytes_read = at + 8;
             *output_end = position;
             return LZFSE_ZAZZCAT_OK;
-        } else if (op == 0x0E || op == 0x16) {
-            // No-op.
-        } else if (op == 0xE0) {
-            // Literals: 16 + the next byte.
-            if (available < 2) return LZFSE_ZAZZCAT_TRUNCATED;
-            o = (lzvn_opcode){2, 16 + (size_t)source[at + 1], 0, NO_MATCH};
-        } else if (op >= 0xE1 && op <= 0xEF) {
-            // Literals: 1 to 15.
-            o = (lzvn_opcode){1, op & 0x0F, 0, NO_MATCH};
-        } else if (op == 0xF0) {
-            // Match at the previous distance: 16 + the next byte.
-            if (available < 2) return LZFSE_ZAZZCAT_TRUNCATED;
-            o = (lzvn_opcode){2, 0, 16 + (size_t)source[at + 1], REUSE_DISTANCE};
-        } else if (op >= 0xF1) {
-            // Match at the previous distance: 1 to 15.
-            o = (lzvn_opcode){1, 0, op & 0x0F, REUSE_DISTANCE};
-        } else if (is_undefined_opcode(op)) {
+        default:
             return LZFSE_ZAZZCAT_CORRUPT;
-        } else if (op >= 0xA0 && op <= 0xBF) {
-            // Medium distance: 0-3 literals, match length 3-34, 14-bit distance.
-            if (available < 3) return LZFSE_ZAZZCAT_TRUNCATED;
-            size_t word = load_u16(source + at + 1);
-            o = (lzvn_opcode){3, (op >> 3) & 3, ((((size_t)op & 7) << 2) | (word & 3)) + 3, word >> 2};
-        } else {
-            // Small and large distance, or previous distance: 0-3 literals, match length 3-10.
-            size_t literals = op >> 6, match = ((op >> 3) & 7) + 3;
-            size_t low_bits = op & 7;
-            if (low_bits == 7) {
-                if (available < 3) return LZFSE_ZAZZCAT_TRUNCATED;
-                o = (lzvn_opcode){3, literals, match, load_u16(source + at + 1)};
-            } else if (low_bits == 6) {
-                o = (lzvn_opcode){1, literals, match, REUSE_DISTANCE};
-            } else {
-                if (available < 2) return LZFSE_ZAZZCAT_TRUNCATED;
-                o = (lzvn_opcode){2, literals, match, (low_bits << 8) | source[at + 1]};
-            }
         }
         // Every opcode but end-of-stream needs at least one more byte after its literals.
-        if (available <= o.opcode_length + o.literal_length) return LZFSE_ZAZZCAT_TRUNCATED;
-        at += o.opcode_length;
+        if (available <= opcode_length + literal_length) return LZFSE_ZAZZCAT_TRUNCATED;
+        at += opcode_length;
         // Fast path: the shared wide-copy token routine, which makes no calls. The literals sit in the stream
         // right after the opcode. A literal-only opcode passes match length 0 and distance 1, which always passes
         // its distance check because it carries at least one literal. Anything near either buffer's end, or
-        // invalid, falls through to the exact copies below.
-        size_t fast_match_length = o.distance == NO_MATCH ? 0 : o.match_length;
-        size_t fast_distance = o.distance == NO_MATCH         ? 1
-                               : o.distance == REUSE_DISTANCE ? previous_distance
-                                                              : o.distance;
-        if (decode_token_fast(output, output_capacity, position, source, source_length, at, o.literal_length,
-                              fast_distance, fast_match_length)) {
-            at += o.literal_length;
-            position += o.literal_length + fast_match_length;
-            if (o.distance != NO_MATCH) previous_distance = fast_distance;
+        // invalid (such as a previous distance of 0), falls through to the exact copies below.
+        if (decode_token_fast(output, output_capacity, position, source, source_length, at, literal_length, distance,
+                              match_length)) {
+            at += literal_length;
+            position += literal_length + match_length;
+            // Every opcode with a match has a match length of at least 1.
+            if (match_length != 0) previous_distance = distance;
             continue;
         }
-        if (o.literal_length > 0) {
-            if (o.literal_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
-            copy_bytes(output + position, source + at, o.literal_length);
-            at += o.literal_length;
-            position += o.literal_length;
+        if (literal_length > 0) {
+            if (literal_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
+            copy_bytes(output + position, source + at, literal_length);
+            at += literal_length;
+            position += literal_length;
         }
-        if (o.distance != NO_MATCH) {
-            size_t distance = o.distance == REUSE_DISTANCE ? previous_distance : o.distance;
+        if (match_length != 0) {
             if (distance == 0 || distance > position) return LZFSE_ZAZZCAT_CORRUPT;
-            if (o.match_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
-            copy_match_exact(output, position, distance, o.match_length);
-            position += o.match_length;
+            if (match_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
+            copy_match_exact(output, position, distance, match_length);
+            position += match_length;
             previous_distance = distance;
         }
     }
