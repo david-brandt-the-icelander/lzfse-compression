@@ -63,7 +63,8 @@ section 5).
 
 [`docs/DESIGN.md`](docs/DESIGN.md) has the goals, the format notes (block types, FSE tables, LZVN opcodes,
 decmpfs), the architecture and the benchmark method. The format was implemented from public descriptions and
-black-box tests; Apple's reference source was consulted for format facts only, never copied.
+black-box tests. Apple's BSD-licensed reference was consulted for format facts and, later, studied for its encoder's
+design; none of its code was copied.
 
 ## License
 

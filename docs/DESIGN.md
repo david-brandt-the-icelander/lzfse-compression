@@ -27,6 +27,7 @@ Non-goals for now:
 
 - **Sources:** the format is implemented from public descriptions and from black-box testing against Apple's `libcompression` and the BSD reference ([lzfse/lzfse](https://github.com/lzfse/lzfse)).
 - **No ported code:** no reference code is copied or translated line by line. We may consult the reference source as documentation of the format, for example to confirm a constant or a header field, and record that in commit messages.
+- **Design ideas:** since 2026-11-14 (owner's decision), the reference encoder's design may also be studied. Ideas are not covered by its BSD-3-Clause license; copied or translated code would be, so we still write our own. So far this means the deferred ("pending") match and indexing every position, as described in M. Hron, *Compression method LZFSE*, CTU Prague 2018, section 4.1.1.
 - **Licensing:** the BSD-3 reference may be built in tests and benchmarks as a comparison target. It is never linked into the library.
 
 ## 3. Format notes
@@ -191,6 +192,31 @@ Two tables are probed at every position, after the previous distance:
 Common short strings (frequent words, JSON keys) refill the short buckets constantly. They push out the one
 candidate that starts a long repeat, so with the short table alone the encoder settled for many 10–15-byte matches.
 The long table keeps those starts.
+
+**Held-back match.** The parser holds the last match back instead of emitting it at once. If the next match extends
+backward over all of it, the held one is dropped: one token instead of two. This is the common case in JSON logs,
+where a short match on a shared prefix (`{"parentUuid":"`) is followed by a long copy that includes the prefix. The
+reference encoder keeps a pending match for the same reason.
+
+**Indexing inside matches.** Every position inside a match goes into the long table. Inside matches longer than 64
+bytes, only the first and last 16 positions also go into the short table, so that long copies do not flush its
+buckets. Content that repeats later in edited form (successive versions of a file in a session log) is then found
+again right after each edit, at its nearest earlier copy.
+
+On the owner's 552 MB Claude Code session log (M3 Pro, `lzfse-bench --stats`), Apple stores 0.1784 at 1 MiB chunks
+and 0.1604 whole:
+
+| Encoder | 1 MiB chunks | Whole |
+|---|---:|---:|
+| Both tables | 0.1854 | 0.1722 |
+| Plus the held-back match | 0.1837 | 0.1704 |
+| Plus indexing inside matches (shipped) | **0.1747** | **0.1567** |
+
+Tried and not shipped:
+- **Indexing interiors in the short table too:** 0.4% smaller on that log, but it flushes the short buckets.
+- **Larger tables (16 bits) with lazy matching up to 32 bytes:** another 1% smaller, for 5–20% slower encoding.
+- **Trying every position inside a short held match:** worse in both ratio and speed, because a replaced match's
+  bytes became literals.
 
 Hashing more bytes in the single table was tried first and rejected. It helped repetitive text but cost real
 binaries up to 8% of ratio, because they depend on 4–6-byte matches.
