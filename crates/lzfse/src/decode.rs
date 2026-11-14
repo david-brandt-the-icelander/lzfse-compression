@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::bits::BitReader;
 use crate::format::*;
 use crate::fse::{self, LitEntry, ValueEntry};
-use crate::kernels::{copy_match_cold, copy_match_wild, wild_copy, SLACK};
+use crate::kernels::{copy_match_cold, token_wild, SLACK};
 use crate::{lzvn, Error};
 
 /// A reusable decoder: its tables and literal buffer carry over between calls, which helps when decoding many
@@ -218,27 +218,22 @@ fn decode_tokens(
     let (mut ls, mut ms, mut ds) = (h.l_state as u32, h.m_state as u32, h.d_state as u32);
     let mut lit = 0usize;
     let n_lits = (h.n_literals as usize + 3) & !3;
-    let mut d_prev: Option<usize> = None;
+    // 0 until the first token sets it, so a block starting with "repeat the previous distance" fails below.
+    let mut d_prev = 0usize;
     for _ in 0..h.n_matches {
         r.refill()?;
         let l = fse::decode_value(&mut ls, lt, &mut r) as usize;
         let m = fse::decode_value(&mut ms, mt, &mut r) as usize;
         let d_new = fse::decode_value(&mut ds, dt, &mut r) as usize;
-        let d = if d_new != 0 {
-            d_new
-        } else {
-            d_prev.ok_or(Error::Corrupt)?
-        };
-        d_prev = Some(d);
-        if lit + l > n_lits || d > pos + l {
+        let d = if d_new != 0 { d_new } else { d_prev };
+        d_prev = d;
+        if lit + l > n_lits {
             return Err(Error::Corrupt);
         }
-        if pos + l + m + SLACK <= dst.len() {
-            // Fast path: wide copies that may scribble into the slack past the token, which later tokens overwrite.
-            wild_copy(dst, pos, &s.literals, lit, l);
-            copy_match_wild(dst, pos + l, d, m);
-        } else {
-            token_near_end(dst, pos, &s.literals[lit..lit + l], d, m)?;
+        // Fast path: one bounds check and wide copies that may scribble into the slack past the token, which later
+        // tokens overwrite. Everything else (buffer ends, bad distances, long short-period runs) goes out of line.
+        if !token_wild(dst, pos, &s.literals, lit, l, d, m) {
+            token_slow(dst, pos, &s.literals[lit..lit + l], d, m)?;
         }
         lit += l;
         pos += l + m;
@@ -246,20 +241,25 @@ fn decode_tokens(
     Ok(pos)
 }
 
-// Execute one token with exact copies near the end of the output (out of line: it is rarely taken).
+// Execute a token the fast kernel declined: check its distance, then copy exactly (out of line: it is rarely
+// taken, and keeping its calls out of the hot loop keeps the decoder's state in registers).
 #[cold]
 #[inline(never)]
-fn token_near_end(
-    dst: &mut [u8],
-    pos: usize,
-    lits: &[u8],
-    d: usize,
-    m: usize,
-) -> Result<(), Error> {
-    if pos + lits.len() + m > dst.len() {
+fn token_slow(dst: &mut [u8], pos: usize, lits: &[u8], d: usize, m: usize) -> Result<(), Error> {
+    let end = pos + lits.len();
+    if d == 0 || d > end {
+        return Err(Error::Corrupt);
+    }
+    if end + m > dst.len() {
         return Err(Error::OutputTooSmall);
     }
-    dst[pos..pos + lits.len()].copy_from_slice(lits);
-    copy_match_cold(dst, pos + lits.len(), d, m);
+    dst[pos..end].copy_from_slice(lits);
+    if d == 1 {
+        // A run of one byte (zeros, padding): memset speed.
+        let b = dst[end - 1];
+        dst[end..end + m].fill(b);
+    } else {
+        copy_match_cold(dst, end, d, m);
+    }
     Ok(())
 }

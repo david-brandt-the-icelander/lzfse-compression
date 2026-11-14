@@ -147,67 +147,81 @@ pub fn wild_copy(dst: &mut [u8], pos: usize, src: &[u8], at: usize, n: usize) {
     }
 }
 
-// Like `copy_match`, but with wide steps that may write up to 15 bytes past `pos + m`. Falls back to the exact
-// copy if `out` lacks the spare bytes or the distance is out of range.
+// Execute one decoded token: copy `l` literals from `lits[lit..]` to `out[pos..]`, then `m` bytes from distance
+// `d` behind the new end. One combined check stands for all the copies' bounds, and the body makes no calls, so
+// the decoder's hot loop keeps its state in registers. Returns false, having written nothing, when the token
+// needs the careful path: too close to the end of either buffer, an invalid distance, or a long run of a
+// pattern shorter than 8 bytes.
 #[inline(always)]
 #[allow(unsafe_code)]
-pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
-    if d == 0 || d > pos || !room(out.len(), pos, m) {
-        copy_match_cold(out, pos, d, m);
-        return;
+pub fn token_wild(
+    out: &mut [u8],
+    pos: usize,
+    lits: &[u8],
+    lit: usize,
+    l: usize,
+    d: usize,
+    m: usize,
+) -> bool {
+    let end = pos + l;
+    let ok = l <= MAX_TOKEN
+        && m <= MAX_TOKEN
+        && end + m + SLACK <= out.len()
+        && lit + l + 16 <= lits.len()
+        && d.wrapping_sub(1) < end
+        && (d >= 8 || m <= 64);
+    if !ok {
+        return false;
     }
-    if d == 1 {
-        // A run of one byte: memset speed.
-        let b = out[pos - 1];
-        out[pos..pos + m].fill(b);
-        return;
-    }
-    if d < 8 && m > 64 {
-        // Long runs of a short pattern: copying in doubling chunks beats fixed 8-byte steps.
-        copy_match_cold(out, pos, d, m);
-        return;
-    }
-    if d < 8 {
-        // Write the first 8 bytes one by one (the pattern repeats every `d`), then copy 8 bytes per step from `p`
-        // back, where `p` is the smallest multiple of `d` that is at least 8, so source and destination never
-        // overlap.
-        for i in 0..8 {
-            out[pos + i] = out[pos + i - d];
-        }
-        let p = d * 8usize.div_ceil(d);
-        let dst = out[pos..].as_mut_ptr();
-        let mut c = 8;
-        while c < m {
-            // SAFETY: the destination ends at `pos + c + 8 <= pos + m + 15 < out.len()`. Since `8 <= p < 8 + d`
-            // and `c >= 8`, the source starts after `pos - d >= 0` and ends at or before the destination's start,
-            // so both ranges are in bounds, they do not overlap, and the source bytes are already written.
-            unsafe { copy8(dst.add(c).sub(p), dst.add(c)) };
-            c += 8;
-        }
-        return;
-    }
-    let dst = out[pos..].as_mut_ptr();
-    // SAFETY: both ranges lie within `out` (checked above). Each step copies at most `d` bytes, so its source range
-    // ends at or before its destination range starts and every source byte was written by an earlier step.
+    // SAFETY: the check above (with `l`, `m` below MAX_TOKEN so nothing overflows) keeps every step inside both
+    // buffers: literal steps read at most `lit + l + 15 < lits.len()` and write at most `end + 15`; match steps
+    // write at most `end + m + 15 < out.len()` and read from `end - d >= 0` onward. `lits` and `out` are distinct.
+    // Each match step copies at most `d` bytes (or, for `d < 8`, one byte at a time and then 8 bytes from a
+    // multiple of `d` at least 8 back), so it only reads bytes already written.
     unsafe {
-        let src = dst.sub(d);
-        if d >= 16 {
-            copy16(src, dst);
+        let s = lits.as_ptr().add(lit);
+        let o = out.as_mut_ptr().add(pos);
+        copy16(s, o);
+        if l > 16 {
             let mut c = 16;
-            while c < m {
-                copy16(src.add(c), dst.add(c));
+            while c < l {
+                copy16(s.add(c), o.add(c));
                 c += 16;
             }
-        } else {
-            copy8(src, dst);
+        }
+        let o = o.add(l);
+        let src = o.sub(d);
+        if d >= 16 {
+            copy16(src, o);
+            let mut c = 16;
+            while c < m {
+                copy16(src.add(c), o.add(c));
+                c += 16;
+            }
+        } else if d >= 8 {
+            copy8(src, o);
             let mut c = 8;
             while c < m {
-                copy8(src.add(c), dst.add(c));
+                copy8(src.add(c), o.add(c));
+                c += 8;
+            }
+        } else {
+            for i in 0..8 {
+                *o.add(i) = *src.add(i);
+            }
+            let p = d * 8usize.div_ceil(d);
+            let mut c = 8;
+            while c < m {
+                copy8(o.add(c).sub(p), o.add(c));
                 c += 8;
             }
         }
     }
+    true
 }
+
+// Largest literal or match length a token can carry (MAX_M), so sums of positions never overflow.
+const MAX_TOKEN: usize = 1 << 16;
 
 // Safe reference versions of the wide copies, which the unsafe ones are tested against.
 #[cfg(test)]
@@ -218,22 +232,6 @@ mod reference {
         while c < n {
             dst[pos + c..pos + c + 16].copy_from_slice(&src[at + c..at + c + 16]);
             c += 16;
-        }
-    }
-
-    // Copy a match in 8- or 16-byte steps with checked slices, or exactly for short distances.
-    pub fn copy_match_wild(out: &mut [u8], pos: usize, d: usize, m: usize) {
-        if d < 8 {
-            super::copy_match(out, pos, d, m);
-            return;
-        }
-        let step = if d >= 16 { 16 } else { 8 };
-        let mut c = 0;
-        while c < m {
-            let mut t = [0u8; 16];
-            t[..step].copy_from_slice(&out[pos - d + c..pos - d + c + step]);
-            out[pos + c..pos + c + step].copy_from_slice(&t[..step]);
-            c += step;
         }
     }
 }
@@ -262,22 +260,6 @@ mod tests {
     // The unsafe wide copies write exactly what the safe reference versions write, slack included.
     #[test]
     fn unsafe_copies_match_reference() {
-        for d in 1..40 {
-            for m in 0..90 {
-                let mut a: alloc::vec::Vec<u8> =
-                    (0..200u8).chain(core::iter::repeat(0).take(200)).collect();
-                let mut b = a.clone();
-                let before = a.clone();
-                copy_match_wild(&mut a, 200, d, m);
-                reference::copy_match_wild(&mut b, 200, d, m);
-                assert_eq!(a[..200 + m], b[..200 + m], "d={d} m={m}");
-                assert_eq!(
-                    a[200 + m + 16..],
-                    before[200 + m + 16..],
-                    "wrote past the slack: d={d} m={m}"
-                );
-            }
-        }
         let src: alloc::vec::Vec<u8> = (0..120u8).collect();
         for n in 0..90 {
             let (mut a, mut b) = ([0u8; 120], [0u8; 120]);
@@ -293,9 +275,47 @@ mod tests {
         let mut tight = [0u8; 20];
         wild_copy(&mut tight, 0, &src, 0, 20);
         assert_eq!(tight[..], src[..20]);
-        let mut tight: alloc::vec::Vec<u8> = (0..30u8).collect();
-        copy_match_wild(&mut tight, 20, 10, 10);
-        assert_eq!(tight[20..], tight[10..20]);
+    }
+
+    // The token kernel matches literal-then-match copies done byte by byte, never writes past its slack, and
+    // declines tokens it cannot do safely.
+    #[test]
+    fn token_wild_matches_reference() {
+        let lits: alloc::vec::Vec<u8> = (100..220u8).collect();
+        for d in 1..40usize {
+            for l in [0usize, 1, 7, 16, 17, 33] {
+                for m in [0usize, 1, 3, 8, 9, 16, 31, 64, 65, 90] {
+                    let mut a: alloc::vec::Vec<u8> =
+                        (0..60u8).chain(core::iter::repeat(0).take(300)).collect();
+                    let before = a.clone();
+                    let done = token_wild(&mut a, 60, &lits, 5, l, d, m);
+                    if d < 8 && m > 64 {
+                        assert!(!done && a == before, "d={d} l={l} m={m} should decline");
+                        continue;
+                    }
+                    assert!(done, "d={d} l={l} m={m}");
+                    let mut b = before.clone();
+                    b[60..60 + l].copy_from_slice(&lits[5..5 + l]);
+                    for i in 0..m {
+                        b[60 + l + i] = b[60 + l + i - d];
+                    }
+                    let e = 60 + l + m;
+                    assert_eq!(a[..e], b[..e], "d={d} l={l} m={m}");
+                    assert_eq!(
+                        a[e + 16..],
+                        before[e + 16..],
+                        "wrote past the slack: d={d} l={l} m={m}"
+                    );
+                }
+            }
+        }
+        // Declines: distance 0 or beyond the start, too little room in the output or the literals.
+        let mut out = [0u8; 100];
+        assert!(!token_wild(&mut out, 10, &lits, 0, 2, 0, 4));
+        assert!(!token_wild(&mut out, 10, &lits, 0, 2, 13, 4));
+        assert!(!token_wild(&mut out, 60, &lits, 0, 2, 5, 10));
+        assert!(!token_wild(&mut out, 10, &lits, 110, 2, 5, 4));
+        assert_eq!(out, [0u8; 100]);
     }
 
     // The room check counts the always-run first step: zero-length copies still need 16 bytes, and nothing
@@ -326,10 +346,10 @@ mod tests {
             for m in 0..20 {
                 let mut out: alloc::vec::Vec<u8> =
                     (0..12u8).chain(core::iter::repeat(0).take(m)).collect();
-                let mut want = out.clone();
-                copy_match_wild(&mut out, 12, d, m);
-                copy_match(&mut want, 12, d, m);
-                assert_eq!(out, want, "d={d} m={m}");
+                let before = out.clone();
+                // Without room for its slack, the token kernel declines and leaves the buffer alone.
+                assert!(!token_wild(&mut out, 12, &src, 0, 0, d, m), "d={d} m={m}");
+                assert_eq!(out, before, "d={d} m={m}");
             }
         }
     }
@@ -342,9 +362,12 @@ mod tests {
                 let mut a: alloc::vec::Vec<u8> =
                     (0..200u8).chain(core::iter::repeat(0).take(200)).collect();
                 let mut b = a.clone();
-                copy_match_wild(&mut a, 200, d, m);
-                copy_match(&mut b, 200, d, m);
-                assert_eq!(a[..200 + m], b[..200 + m], "d={d} m={m}");
+                if token_wild(&mut a, 200, &[0; 16], 0, 0, d, m) {
+                    copy_match(&mut b, 200, d, m);
+                    assert_eq!(a[..200 + m], b[..200 + m], "d={d} m={m}");
+                } else {
+                    assert!(d < 8 && m > 64, "declined d={d} m={m}");
+                }
             }
         }
         let src: alloc::vec::Vec<u8> = (0..100u8).collect();
