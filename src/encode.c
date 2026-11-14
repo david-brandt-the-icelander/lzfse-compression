@@ -1,5 +1,6 @@
 // LZFSE stream encoder: chooses the block type, finds matches in inputs over 64 KiB, and hands tokens to the
 // block writer. Inputs of 64 KiB or less use the fast path in encode_small.c.
+#include "buffer.h"
 #include "encode_internal.h"
 #include "lzvn.h"
 
@@ -232,7 +233,9 @@ lzfse_zazzcat_status lzfse_zazzcat_encoder_encode(lzfse_zazzcat_encoder *e, cons
     } else if (length < LZFSE_ZAZZCAT_LZVN_THRESHOLD) {
         // Small inputs: one LZVN block, or a raw block if LZVN does not make it smaller.
         if (!buffer_reserve(output, LZVN_HEADER_SIZE)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-        memset(output->data + mark, 0, LZVN_HEADER_SIZE);
+        // Not cleared: this placeholder is reserved space. On success the store_u32_x3 call below overwrites
+        // all 12 bytes; otherwise output->length goes back to `mark` and the placeholder is dropped.
+        // clear_bytes(output->data + mark, LZVN_HEADER_SIZE);
         output->length += LZVN_HEADER_SIZE;
         status = lzvn_encode_with_table(source, length, output, &e->lzvn_table);
         size_t payload = output->length - mark - LZVN_HEADER_SIZE;

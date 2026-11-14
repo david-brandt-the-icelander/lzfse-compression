@@ -4,6 +4,8 @@
 // persist between calls, so a warmed-up call allocates nothing.
 //
 // Build with LZFSE_ZAZZCAT_NO_THREADS to get a serial version of the same API (for platforms without pthreads).
+#include "bare_functions.h"
+#include "buffer.h"
 #include "common.h"
 
 // Tasks per thread: enough for load balancing, few enough that each task's buffer is large.
@@ -78,7 +80,7 @@ static bool scratch_reserve(lzfse_zazzcat_buffer **buffers, size_t *buffer_capac
         lzfse_zazzcat_buffer *grown = zz_realloc(*buffers, task_count * sizeof *grown);
         if (grown == NULL) return false;
         // New entries start as empty buffers.
-        memset(grown + *buffer_capacity, 0, (task_count - *buffer_capacity) * sizeof *grown);
+        clear_bytes(grown + *buffer_capacity, (task_count - *buffer_capacity) * sizeof *grown);
         *buffers = grown;
         *buffer_capacity = task_count;
     }
@@ -204,15 +206,15 @@ static void *worker_main(void *argument) {
     size_t thread_index = (size_t)(uintptr_t)argument;
     uint64_t seen_generation = 0;
     for (;;) {
-        pthread_mutex_lock(&pool.mutex);
-        while (pool.generation == seen_generation) pthread_cond_wait(&pool.job_ready, &pool.mutex);
+        bare_pthread_mutex_lock(&pool.mutex);
+        while (pool.generation == seen_generation) bare_pthread_cond_wait(&pool.job_ready, &pool.mutex);
         seen_generation = pool.generation;
         job *j = pool.current_job;
-        pthread_mutex_unlock(&pool.mutex);
+        bare_pthread_mutex_unlock(&pool.mutex);
         run_tasks(j, thread_index);
-        pthread_mutex_lock(&pool.mutex);
-        if (++pool.finished_workers == pool.thread_count - 1) pthread_cond_signal(&pool.job_finished);
-        pthread_mutex_unlock(&pool.mutex);
+        bare_pthread_mutex_lock(&pool.mutex);
+        if (++pool.finished_workers == pool.thread_count - 1) bare_pthread_cond_signal(&pool.job_finished);
+        bare_pthread_mutex_unlock(&pool.mutex);
     }
     return NULL;
 }
@@ -222,23 +224,23 @@ static void *worker_main(void *argument) {
 static void pool_start(void) {
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
     size_t wanted = cpus > 0 ? (size_t)cpus : 1;
-    pthread_mutex_init(&pool.call_mutex, NULL);
-    pthread_mutex_init(&pool.mutex, NULL);
-    pthread_cond_init(&pool.job_ready, NULL);
-    pthread_cond_init(&pool.job_finished, NULL);
+    bare_pthread_mutex_init(&pool.call_mutex, NULL);
+    bare_pthread_mutex_init(&pool.mutex, NULL);
+    bare_pthread_cond_init(&pool.job_ready, NULL);
+    bare_pthread_cond_init(&pool.job_finished, NULL);
     pool.encoders = zz_calloc(wanted, sizeof *pool.encoders);
     pool.thread_count = 1;
     if (pool.encoders == NULL) return;
     for (size_t i = 1; i < wanted; i++) {
         pthread_t thread;
         if (pthread_create(&thread, NULL, worker_main, (void *)(uintptr_t)i) != 0) break;
-        pthread_detach(thread);
+        bare_pthread_detach(thread);
         pool.thread_count++;
     }
 }
 
 size_t lzfse_zazzcat_parallelism(void) {
-    pthread_once(&pool_once, pool_start);
+    bare_pthread_once(&pool_once, pool_start);
     return pool.thread_count;
 }
 
@@ -258,10 +260,10 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
     size_t chunks_per_task = div_ceil(chunk_count, threads * TASKS_PER_THREAD);
     size_t task_count = div_ceil(chunk_count, chunks_per_task);
 
-    pthread_mutex_lock(&pool.call_mutex);
+    bare_pthread_mutex_lock(&pool.call_mutex);
     if (!scratch_reserve(&pool.task_buffers, &pool.task_buffer_capacity, task_count, &pool.ends, &pool.ends_capacity,
                          chunk_count)) {
-        pthread_mutex_unlock(&pool.call_mutex);
+        bare_pthread_mutex_unlock(&pool.call_mutex);
         return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
     }
     job j = {
@@ -293,13 +295,13 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
         pthread_mutex_lock(&pool.mutex);
         while (pool.finished_workers < pool.thread_count - 1) pthread_cond_wait(&pool.job_finished, &pool.mutex);
         pool.current_job = NULL;
-        pthread_mutex_unlock(&pool.mutex);
+        bare_pthread_mutex_unlock(&pool.mutex);
     }
     lzfse_zazzcat_status status = (lzfse_zazzcat_status)atomic_load(&j.status);
     if (status == LZFSE_ZAZZCAT_OK) {
         status = gather(pool.task_buffers, task_count, pool.ends, chunks_per_task, chunk_count, output, offsets);
     }
-    pthread_mutex_unlock(&pool.call_mutex);
+    bare_pthread_mutex_unlock(&pool.call_mutex);
     return status;
 }
 

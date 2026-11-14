@@ -1,4 +1,5 @@
 // APFS/HFS+ transparent compression containers (decmpfs) for LZFSE (types 11 and 12) and LZVN (types 7 and 8).
+#include "buffer.h"
 #include "format.h"
 #include "lzvn.h"
 
@@ -19,13 +20,16 @@ void lzfse_zazzcat_decmpfs_free(lzfse_zazzcat_decmpfs *compressed) {
 }
 
 lzfse_zazzcat_status lzfse_zazzcat_decmpfs_compress(const void *data, size_t length, lzfse_zazzcat_decmpfs *result) {
-    memset(result, 0, sizeof *result);
+    clear_bytes(result, sizeof *result);
     size_t chunk_count = div_ceil(length, LZFSE_ZAZZCAT_DECMPFS_CHUNK);
     size_t table_size = 4 * (chunk_count + 1);
     // Encode the chunks straight into the fork after room for the offset table, then fill in the table.
     lzfse_zazzcat_buffer *fork = &result->fork;
     if (!buffer_reserve(fork, table_size)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-    memset(fork->data, 0, table_size);
+    // Not cleared: lzfse_zazzcat_encode_chunks always returns chunk_count + 1 offsets, and the resource-fork
+    // path below stores every one of them, filling all table_size bytes. The inline path sets fork->length to 0,
+    // so the table is dropped. On failure the fork is freed.
+    // clear_bytes(fork->data, table_size);
     fork->length = table_size;
     lzfse_zazzcat_offsets offsets = {NULL, 0, 0};
     lzfse_zazzcat_status status =
@@ -55,7 +59,7 @@ lzfse_zazzcat_status lzfse_zazzcat_decmpfs_compress(const void *data, size_t len
 lzfse_zazzcat_status lzfse_zazzcat_decmpfs_parse_header(const void *xattr_bytes, size_t xattr_length, uint32_t *type,
                                                         uint64_t *uncompressed_size) {
     const uint8_t *xattr = xattr_bytes;
-    if (xattr_length < DECMPFS_HEADER_SIZE || memcmp(xattr, decmpfs_magic, 4) != 0) return LZFSE_ZAZZCAT_CORRUPT;
+    if (xattr_length < DECMPFS_HEADER_SIZE || compare_bytes(xattr, decmpfs_magic, 4) != 0) return LZFSE_ZAZZCAT_CORRUPT;
     *type = load_u32(xattr + 4);
     *uncompressed_size = load_u64(xattr + 8);
     return LZFSE_ZAZZCAT_OK;
@@ -78,7 +82,7 @@ static lzfse_zazzcat_status decode_chunk(uint32_t type, const uint8_t *chunk, si
         raw = true;
     }
     if (raw) {
-        memcpy(destination, chunk + 1, size);
+        copy_bytes(destination, chunk + 1, size);
         return LZFSE_ZAZZCAT_OK;
     }
     size_t decoded = 0;

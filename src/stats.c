@@ -1,5 +1,6 @@
 // Stream statistics for diagnostics: totals and token distributions read from block headers and match streams,
 // without decoding any output. The benchmark uses them to compare what two encoders chose on the same input.
+#include "bare_functions.h"
 #include "bits.h"
 #include "format.h"
 #include "fse.h"
@@ -85,7 +86,7 @@ lzfse_zazzcat_status lzfse_zazzcat_stream_stats_add(lzfse_zazzcat_stream_stats *
             uint32_t previous_distance = 0;
             for (uint32_t t = 0; t < h.token_count; t++) {
                 if ((status = bit_reader_refill(&reader))) break;
-                fse_decode_value(&l_state, l_table, LITERAL_LENGTH_STATES - 1, &reader);
+                bare_fse_decode_value(&l_state, l_table, LITERAL_LENGTH_STATES - 1, &reader);
                 uint32_t match = fse_decode_value(&m_state, m_table, MATCH_LENGTH_STATES - 1, &reader);
                 uint32_t coded = fse_decode_value(&d_state, d_table, DISTANCE_STATES - 1, &reader);
                 // Literal-only tokens carry a distance too, and it becomes the previous distance.

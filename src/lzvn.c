@@ -3,6 +3,7 @@
 // An LZVN stream is a sequence of opcodes. Each opcode carries some literal bytes (copied from the stream) and/or
 // a match (bytes copied from earlier output), in one of several compact layouts chosen by the opcode byte.
 #include "lzvn.h"
+#include "buffer.h"
 
 #include "copy.h"
 
@@ -88,7 +89,7 @@ static lzfse_zazzcat_status decode_run(const uint8_t *source, size_t source_leng
         at += o.opcode_length;
         if (o.literal_length > 0) {
             if (o.literal_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
-            memcpy(output + position, source + at, o.literal_length);
+            copy_bytes(output + position, source + at, o.literal_length);
             at += o.literal_length;
             position += o.literal_length;
         }
@@ -211,7 +212,7 @@ lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzf
     }
     // Entries hold position + 1, so 0 means empty.
     uint32_t *slots = table->entries;
-    memset(slots, 0, entries * sizeof *slots);
+    clear_bytes(slots, entries * sizeof *slots);
     uint32_t shift = 32 - bits;
     size_t i = 0, literal_start = 0, previous_distance = 0;
     while (i + 4 <= n) {

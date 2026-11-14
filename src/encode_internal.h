@@ -56,7 +56,7 @@ ALWAYS_INLINE void block_writer_token(block_writer *blocks, const uint8_t *sourc
     if (literal_start + literal_length + 16 <= source_length) {
         wild_copy(literal_destination, source + literal_start, literal_length);
     } else {
-        memcpy(literal_destination, source + literal_start, literal_length);
+        copy_bytes(literal_destination, source + literal_start, literal_length);
     }
     blocks->literal_count += literal_length;
     blocks->covered_bytes += literal_length + length;

@@ -1,8 +1,20 @@
-# Formatting for the C sources (checked in CI with `make format-check`; apply with clang-format -i).
+# Formatting for the C sources. Apply with `make format`; CI runs `make format-check`.
+Language: Cpp
 BasedOnStyle: LLVM
+Standard: c++11
 IndentWidth: 4
+ContinuationIndentWidth: 4
+UseTab: Never
 ColumnLimit: 120
+PointerAlignment: Right
+DerivePointerAlignment: false
 AllowShortFunctionsOnASingleLine: Empty
 AllowShortIfStatementsOnASingleLine: WithoutElse
 AllowShortLoopsOnASingleLine: true
 AlignConsecutiveMacros: true
+# Include order matters in this project (config macros, platform headers), so never reorder includes.
+SortIncludes: Never
+InsertNewlineAtEOF: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+ReflowComments: true

@@ -39,14 +39,14 @@ ALWAYS_INLINE size_t match_length_backward(const uint8_t *buffer, size_t earlier
 // 1 <= distance <= position. The pattern is copied in growing pieces, each a whole number of periods.
 ALWAYS_INLINE void copy_match_exact(uint8_t *output, size_t position, size_t distance, size_t length) {
     if (distance >= length) {
-        memmove(output + position, output + position - distance, length);
+        move_bytes(output + position, output + position - distance, length);
         return;
     }
     size_t done = 0;
     size_t piece = distance;
     while (done < length) {
         size_t n = min_size(piece, length - done);
-        memmove(output + position + done, output + position - distance, n);
+        move_bytes(output + position + done, output + position - distance, n);
         done += n;
         piece = max_size(done, distance) - done % distance;
         if (piece == 0) piece = distance;
@@ -55,12 +55,12 @@ ALWAYS_INLINE void copy_match_exact(uint8_t *output, size_t position, size_t dis
 
 // Copy 16 bytes with one unaligned load and one store (memcpy of a constant size compiles to that).
 ALWAYS_INLINE void copy16(uint8_t *destination, const uint8_t *source) {
-    memcpy(destination, source, 16);
+    copy_bytes(destination, source, 16);
 }
 
 // Copy 8 bytes with one unaligned load and one store.
 ALWAYS_INLINE void copy8(uint8_t *destination, const uint8_t *source) {
-    memcpy(destination, source, 8);
+    copy_bytes(destination, source, 8);
 }
 
 // Copy `length` bytes in 16-byte steps, possibly writing up to 15 bytes past the end. Both buffers must have
