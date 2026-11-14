@@ -1,11 +1,11 @@
 # CPU tuning of `src/memory_operations.h`
 
-Status: proposed, nothing implemented. One document per wrapper:
+Status: proposed; only the `move_bytes` step is done (2026-11-14). One document per wrapper:
 
 | Wrapper | Library call sites | Hot? | Plan |
 |---|---|---|---|
 | [`copy_bytes`](copy_bytes.md) | constant-size loads/stores, literal copies, large block and chunk copies | constant sizes yes; large copies at the edges | measure the large copies; probably leave to libc |
-| [`move_bytes`](move_bytes.md) | `copy_match_exact` only | cold path | switch the call to `copy_bytes`; no backend |
+| [`move_bytes`](move_bytes.md) | none (was `copy_match_exact`) | — | done: switched to `copy_bytes`; no backend |
 | [`fill_bytes`](fill_bytes.md) | decoder slow path, one-byte runs | rare | none |
 | [`clear_bytes`](clear_bytes.md) | struct and header zeroing, per-call table resets | small share | none; clear less, not faster |
 | [`compare_bytes`](compare_bytes.md) | one 4-byte magic check, via `equal_bytes` | no | none |
