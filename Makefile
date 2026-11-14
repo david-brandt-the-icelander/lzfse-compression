@@ -14,7 +14,10 @@ CC ?= cc
 BUILD := build
 CPU_FLAGS ?=
 DEFINES ?=
-WARNINGS := -std=c11 -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Werror
+# C11 plus POSIX: under -std=c11, glibc hides POSIX functions and types (lstat, mode_t, popen, clock_gettime)
+# unless _DEFAULT_SOURCE is defined before any system header. macOS shows them anyway and ignores the macro.
+STANDARD := -std=c11 -D_DEFAULT_SOURCE
+WARNINGS := $(STANDARD) -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Werror
 CFLAGS ?= -O3
 ALL_CFLAGS := $(WARNINGS) $(CFLAGS) $(CPU_FLAGS) $(DEFINES) -Iinclude -Isrc -pthread
 LDFLAGS ?=
@@ -67,7 +70,7 @@ test-alloc: $(BUILD)/alloc-tests
 
 FUZZ_TARGETS := decode round_trip lzvn_decode decmpfs
 FUZZ_SECONDS ?= 60
-FUZZ_FLAGS := -std=c11 -O1 -g -Iinclude -Isrc -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all
+FUZZ_FLAGS := $(STANDARD) -O1 -g -Iinclude -Isrc -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all
 
 fuzz: $(patsubst %,$(BUILD)/fuzz/%,$(FUZZ_TARGETS))
 	@for target in $(FUZZ_TARGETS); do \
