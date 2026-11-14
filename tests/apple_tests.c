@@ -19,6 +19,7 @@ void run_apple_tests(void) {}
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include "bare_functions.h"
 #include "file_io.h"
 #include "test_support.h"
 
@@ -30,7 +31,7 @@ void run_apple_tests(void);
 // Compress with Apple's encoder into a new buffer.
 static lzfse_zazzcat_buffer apple_encode(const uint8_t *data, size_t n, compression_algorithm algorithm) {
     size_t capacity = n * 2 + 4096;
-    lzfse_zazzcat_buffer out = {malloc(capacity), 0, capacity};
+    lzfse_zazzcat_buffer out = {raw_malloc(capacity), 0, capacity};
     out.length = compression_encode_buffer(out.data, capacity, data, n, NULL, algorithm);
     CHECK(out.length > 0 || n == 0, "Apple's encoder failed on %zu bytes", n);
     return out;
@@ -39,10 +40,10 @@ static lzfse_zazzcat_buffer apple_encode(const uint8_t *data, size_t n, compress
 // Decompress with Apple's decoder; returns true when it produces exactly `data`.
 static int apple_decodes_to(const lzfse_zazzcat_buffer *stream, const uint8_t *data, size_t n,
                             compression_algorithm algorithm) {
-    uint8_t *out = malloc(n + 1);
+    uint8_t *out = raw_malloc(n + 1);
     size_t got = compression_decode_buffer(out, n + 1, stream->data, stream->length, NULL, algorithm);
-    int same = got == n && (n == 0 || memcmp(out, data, n) == 0);
-    free(out);
+    int same = got == n && (n == 0 || compare_bytes(out, data, n) == 0);
+    raw_free(out);
     return same;
 }
 
@@ -59,7 +60,7 @@ static size_t make_corpus(sample *samples) {
     lzfse_zazzcat_buffer random = noise(400000, 12345), words_all = {0};
     for (size_t i = 0; i < random.length; i++) {
         const char *w = vocabulary[random.data[i] % 9];
-        buffer_append(&words_all, w, strlen(w));
+        bare_buffer_append(&words_all, w, strlen(w));
     }
     snprintf(samples[count].name, 32, "empty");
     samples[count++].data = copy_of("", 0);
@@ -67,7 +68,7 @@ static size_t make_corpus(sample *samples) {
     samples[count++].data = copy_of("abc", 3);
     snprintf(samples[count].name, 32, "zeros");
     samples[count].data = noise(1 << 20, 1);
-    memset(samples[count++].data.data, 0, 1 << 20);
+    clear_bytes(samples[count++].data.data, 1 << 20);
     size_t sizes[] = {7, 8, 100, 4095, 4096, 4097, 65536, 1000000};
     for (int i = 0; i < 8; i++) {
         snprintf(samples[count].name, 32, "words %zu", sizes[i]);
@@ -88,9 +89,10 @@ static size_t make_corpus(sample *samples) {
     while (dir != NULL && (entry = readdir(dir)) != NULL) {
         char path[512];
         snprintf(path, sizeof path, "src/%s", entry->d_name);
-        if (entry->d_name[0] != '.' && read_file(path, &file) == 0) buffer_append(&sources, file.data, file.length);
+        if (entry->d_name[0] != '.' && read_file(path, &file) == 0)
+            bare_buffer_append(&sources, file.data, file.length);
     }
-    if (dir != NULL) closedir(dir);
+    if (dir != NULL) bare_closedir(dir);
     lzfse_zazzcat_buffer_free(&file);
     samples[count++].data = sources;
     lzfse_zazzcat_buffer_free(&random);
@@ -119,7 +121,7 @@ static void test_lzfse_both_directions(void) {
             lzfse_zazzcat_buffer_free(&ours);
         }
         lzfse_zazzcat_buffer ours = {0};
-        lzfse_zazzcat_encode(d->data, d->length, NULL, &ours);
+        bare_lzfse_zazzcat_encode(d->data, d->length, NULL, &ours);
         CHECK(apple_decodes_to(&ours, d->data, d->length, COMPRESSION_LZFSE), "Apple decodes our %s", samples[i].name);
         lzfse_zazzcat_buffer_free(&ours);
     }
@@ -134,14 +136,14 @@ static void test_lzvn_both_directions(void) {
         const lzfse_zazzcat_buffer *d = &samples[i].data;
         if (d->length < 8 || d->length > 300000) continue;
         lzfse_zazzcat_buffer theirs = apple_encode(d->data, d->length, APPLE_LZVN), ours = {0};
-        uint8_t *out = malloc(d->length);
+        uint8_t *out = raw_malloc(d->length);
         size_t written = 0;
         CHECK(lzfse_zazzcat_lzvn_decode(theirs.data, theirs.length, out, d->length, &written) == LZFSE_ZAZZCAT_OK &&
                   same_bytes(out, written, d->data, d->length),
               "decode Apple's LZVN %s", samples[i].name);
-        lzfse_zazzcat_lzvn_encode(d->data, d->length, &ours);
+        bare_lzfse_zazzcat_lzvn_encode(d->data, d->length, &ours);
         CHECK(apple_decodes_to(&ours, d->data, d->length, APPLE_LZVN), "Apple decodes our LZVN %s", samples[i].name);
-        free(out);
+        raw_free(out);
         lzfse_zazzcat_buffer_free(&theirs);
         lzfse_zazzcat_buffer_free(&ours);
     }
@@ -161,9 +163,9 @@ static lzfse_zazzcat_buffer session_like(size_t n, int with_attachments) {
         documents[d] = (lzfse_zazzcat_buffer){0};
         uint32_t k = 200 + test_random_next(&r) % 1800;
         for (uint32_t w = 0; w < k; w++) {
-            if (w) buffer_append(&documents[d], " ", 1);
+            if (w) bare_buffer_append(&documents[d], " ", 1);
             const char *word = vocabulary[test_random_next(&r) % 14];
-            buffer_append(&documents[d], word, strlen(word));
+            bare_buffer_append(&documents[d], word, strlen(word));
         }
     }
     static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -174,23 +176,23 @@ static lzfse_zazzcat_buffer session_like(size_t n, int with_attachments) {
         if (kind < 45) {
             uint32_t count = 20 + test_random_next(&r) % 180;
             for (uint32_t w = 0; w < count; w++) {
-                if (w) buffer_append(&m, " ", 1);
+                if (w) bare_buffer_append(&m, " ", 1);
                 const char *word = vocabulary[test_random_next(&r) % 14];
-                buffer_append(&m, word, strlen(word));
+                bare_buffer_append(&m, word, strlen(word));
             }
         } else if (kind < 70) {
             const lzfse_zazzcat_buffer *doc = &documents[test_random_next(&r) % 30];
-            buffer_append(&m, doc->data, doc->length);
+            bare_buffer_append(&m, doc->data, doc->length);
         } else if (kind < 95 || !with_attachments) {
             size_t back = min_size(1 + test_random_next(&r) % 10, message_count);
             for (size_t i = message_count - back; i < message_count; i++) {
-                if (i > message_count - back) buffer_append(&m, " ", 1);
-                buffer_append(&m, messages[i].data, messages[i].length);
+                if (i > message_count - back) bare_buffer_append(&m, " ", 1);
+                bare_buffer_append(&m, messages[i].data, messages[i].length);
             }
         } else {
             size_t length = 20000 + test_random_next(&r) % 130000;
-            buffer_append(&m, "data:image/png;base64,", 22);
-            buffer_reserve(&m, length);
+            bare_buffer_append(&m, "data:image/png;base64,", 22);
+            bare_buffer_reserve(&m, length);
             for (size_t i = 0; i < length; i++) m.data[m.length++] = (uint8_t)alphabet[test_random_next(&r) & 63];
             is_attachment = 1;
         }
@@ -198,12 +200,12 @@ static lzfse_zazzcat_buffer session_like(size_t n, int with_attachments) {
         uint32_t a = test_random_next(&r), b = test_random_next(&r);
         int prefix_length =
             snprintf(prefix, sizeof prefix, "{\"type\":\"message\",\"uuid\":\"%08x%08x\",\"content\":\"", a, b);
-        buffer_append(&out, prefix, (size_t)prefix_length);
-        buffer_append(&out, m.data, m.length);
-        buffer_append(&out, "\"}\n", 3);
+        bare_buffer_append(&out, prefix, (size_t)prefix_length);
+        bare_buffer_append(&out, m.data, m.length);
+        bare_buffer_append(&out, "\"}\n", 3);
         if (message_count == message_capacity) {
             message_capacity = message_capacity ? message_capacity * 2 : 64;
-            messages = realloc(messages, message_capacity * sizeof *messages);
+            messages = raw_realloc(messages, message_capacity * sizeof *messages);
         }
         if (is_attachment) {
             lzfse_zazzcat_buffer_free(&m);
@@ -213,7 +215,7 @@ static lzfse_zazzcat_buffer session_like(size_t n, int with_attachments) {
     }
     out.length = n;
     for (size_t i = 0; i < message_count; i++) lzfse_zazzcat_buffer_free(&messages[i]);
-    free(messages);
+    raw_free(messages);
     for (int d = 0; d < 30; d++) lzfse_zazzcat_buffer_free(&documents[d]);
     return out;
 }
@@ -237,7 +239,7 @@ static void test_ratio_close_to_apple(void) {
             for (size_t at = 0; at < d->length; at += chunk) {
                 size_t piece = min_size(chunk, d->length - at);
                 lzfse_zazzcat_buffer a = apple_encode(d->data + at, piece, COMPRESSION_LZFSE), b = {0};
-                lzfse_zazzcat_encode(d->data + at, piece, NULL, &b);
+                bare_lzfse_zazzcat_encode(d->data + at, piece, NULL, &b);
                 theirs += a.length;
                 ours += b.length;
                 lzfse_zazzcat_buffer_free(&a);
@@ -245,8 +247,8 @@ static void test_ratio_close_to_apple(void) {
             }
             double difference = 100.0 * ((double)ours / (double)theirs - 1.0);
             if (difference > worst) worst = difference;
-            printf("    %14s %9zu: apple %9zu  ours %9zu  (%+.2f%%)\n", samples[i].name, chunk, theirs, ours,
-                   difference);
+            bare_printf("    %14s %9zu: apple %9zu  ours %9zu  (%+.2f%%)\n", samples[i].name, chunk, theirs, ours,
+                        difference);
         }
     }
     CHECK(worst <= 2.0, "worst ratio gap %+.2f%% (see the table above)", worst);
@@ -258,7 +260,7 @@ static int read_xattr(const char *path, const char *name, lzfse_zazzcat_buffer *
     out->length = 0;
     ssize_t size = getxattr(path, name, NULL, 0, 0, XATTR_SHOWCOMPRESSION);
     if (size < 0) return -1;
-    buffer_reserve(out, (size_t)size + 1);
+    bare_buffer_reserve(out, (size_t)size + 1);
     ssize_t got = getxattr(path, name, out->data, (size_t)size, 0, XATTR_SHOWCOMPRESSION);
     if (got < 0) return -1;
     out->length = (size_t)got;
@@ -282,13 +284,13 @@ static void find_compressed_files(const char *directory, size_t max, char (*path
             snprintf(paths[(*count)++], 512, "%s", path);
         }
     }
-    closedir(dir);
+    bare_closedir(dir);
 }
 
 // Files macOS itself compressed decode with our decmpfs parser to the same bytes the kernel returns.
 static void test_system_compressed_files(void) {
     size_t max = 16000, count = 0;
-    char(*paths)[512] = malloc(max * 512);
+    char (*paths)[512] = raw_malloc(max * 512);
     const char *directories[] = {"/usr/bin", "/usr/libexec", "/System/Library/CoreServices",
                                  "/System/Library/Frameworks"};
     for (int i = 0; i < 4; i++) find_compressed_files(directories[i], count + 4000, paths, &count);
@@ -312,22 +314,22 @@ static void test_system_compressed_files(void) {
               "%s (type %u)", paths[i], type);
         checked++;
     }
-    printf("    compressed files by type:");
+    bare_printf("    compressed files by type:");
     for (int t = 0; t < 16; t++) {
-        if (by_type[t]) printf(" %d: %zu", t, by_type[t]);
+        if (by_type[t]) bare_printf(" %d: %zu", t, by_type[t]);
     }
-    printf("; verified %zu\n", checked);
+    bare_printf("; verified %zu\n", checked);
     CHECK(checked > 0, "no LZFSE/LZVN-compressed system files found to check");
     lzfse_zazzcat_buffer *buffers[] = {&attribute, &fork, &want, &got};
     for (int i = 0; i < 4; i++) lzfse_zazzcat_buffer_free(buffers[i]);
-    free(paths);
+    raw_free(paths);
 }
 
 // Files we compress (inline and resource-fork layouts) read back through the kernel unchanged.
 static void test_kernel_reads_our_files(void) {
     char directory[256];
     snprintf(directory, sizeof directory, "/tmp/lzfse-zazzcat-%d", (int)getpid());
-    mkdir(directory, 0700);
+    bare_mkdir(directory, 0700);
     sample samples[20];
     size_t count = make_corpus(samples);
     lzfse_zazzcat_buffer back = {0};
@@ -336,7 +338,7 @@ static void test_kernel_reads_our_files(void) {
         if (d->length == 0) continue;
         char path[512];
         snprintf(path, sizeof path, "%s/sample%zu", directory, i);
-        write_file(path, "", 0);
+        bare_write_file(path, "", 0);
         lzfse_zazzcat_decmpfs c;
         REQUIRE(lzfse_zazzcat_decmpfs_compress(d->data, d->length, &c) == LZFSE_ZAZZCAT_OK, "compress");
         if (c.fork.length > 0) {
@@ -347,17 +349,17 @@ static void test_kernel_reads_our_files(void) {
               strerror(errno));
         CHECK(chflags(path, UF_COMPRESSED) == 0, "chflags: %s", strerror(errno));
         struct stat info;
-        lstat(path, &info);
+        bare_lstat(path, &info);
         CHECK(info.st_flags & UF_COMPRESSED, "%s: the kernel refused the compressed flag", samples[i].name);
         CHECK((size_t)info.st_size == d->length, "%s: size", samples[i].name);
         CHECK(read_file(path, &back) == 0 && same_bytes(back.data, back.length, d->data, d->length),
               "%s: contents through the kernel", samples[i].name);
-        printf("    %14s: %zu bytes stored as %zu (%lld blocks on disk)\n", samples[i].name, d->length,
-               c.xattr.length + c.fork.length, (long long)info.st_blocks);
+        bare_printf("    %14s: %zu bytes stored as %zu (%lld blocks on disk)\n", samples[i].name, d->length,
+                    c.xattr.length + c.fork.length, (long long)info.st_blocks);
         lzfse_zazzcat_decmpfs_free(&c);
-        unlink(path);
+        bare_unlink(path);
     }
-    rmdir(directory);
+    bare_rmdir(directory);
     lzfse_zazzcat_buffer_free(&back);
     free_corpus(samples, count);
 }

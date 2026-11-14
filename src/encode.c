@@ -1,5 +1,6 @@
 // LZFSE stream encoder: chooses the block type, finds matches in inputs over 64 KiB, and hands tokens to the
 // block writer. Inputs of 64 KiB or less use the fast path in encode_small.c.
+#include "buffer.h"
 #include "encode_internal.h"
 #include "lzvn.h"
 
@@ -70,8 +71,7 @@ void lzfse_zazzcat_encoder_destroy(lzfse_zazzcat_encoder *encoder) {
 static lzfse_zazzcat_status push_uncompressed(lzfse_zazzcat_buffer *output, const uint8_t *source, size_t length) {
     if (length == 0) return LZFSE_ZAZZCAT_OK;
     if (!buffer_reserve(output, UNCOMPRESSED_HEADER_SIZE + length)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-    buffer_push_u32_reserved(output, MAGIC_UNCOMPRESSED);
-    buffer_push_u32_reserved(output, (uint32_t)length);
+    buffer_push_u32_x2_reserved(output, MAGIC_UNCOMPRESSED, (uint32_t)length);
     buffer_append_reserved(output, source, length);
     return LZFSE_ZAZZCAT_OK;
 }
@@ -233,14 +233,14 @@ lzfse_zazzcat_status lzfse_zazzcat_encoder_encode(lzfse_zazzcat_encoder *e, cons
     } else if (length < LZFSE_ZAZZCAT_LZVN_THRESHOLD) {
         // Small inputs: one LZVN block, or a raw block if LZVN does not make it smaller.
         if (!buffer_reserve(output, LZVN_HEADER_SIZE)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-        memset(output->data + mark, 0, LZVN_HEADER_SIZE);
+        // Not cleared: this placeholder is reserved space. On success the store_u32_x3 call below overwrites
+        // all 12 bytes; otherwise output->length goes back to `mark` and the placeholder is dropped.
+        // clear_bytes(output->data + mark, LZVN_HEADER_SIZE);
         output->length += LZVN_HEADER_SIZE;
         status = lzvn_encode_with_table(source, length, output, &e->lzvn_table);
         size_t payload = output->length - mark - LZVN_HEADER_SIZE;
         if (status == LZFSE_ZAZZCAT_OK && payload < length) {
-            store_u32(output->data + mark, MAGIC_LZVN);
-            store_u32(output->data + mark + 4, (uint32_t)length);
-            store_u32(output->data + mark + 8, (uint32_t)payload);
+            store_u32_x3(output->data + mark, MAGIC_LZVN, (uint32_t)length, (uint32_t)payload);
         } else if (status == LZFSE_ZAZZCAT_OK) {
             output->length = mark;
             status = push_uncompressed(output, source, length);

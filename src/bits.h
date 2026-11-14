@@ -3,7 +3,7 @@
 #ifndef LZFSE_ZAZZCAT_BITS_H
 #define LZFSE_ZAZZCAT_BITS_H
 
-#include "common.h"
+#include "buffer.h"
 
 // Forward bit writer: bits gather in a 64-bit accumulator and whole bytes are appended to an output buffer.
 typedef struct bit_writer {
@@ -60,7 +60,7 @@ ALWAYS_INLINE lzfse_zazzcat_status bit_reader_init(bit_reader *reader, const uin
     if (length < take) return LZFSE_ZAZZCAT_CORRUPT;
     size_t position = length - take;
     uint8_t bytes[8] = {0};
-    memcpy(bytes, buffer + position, take);
+    copy_bytes(bytes, buffer + position, take);
     uint64_t accumulator = load_u64(bytes);
     uint32_t bit_count = (uint32_t)(8 * (int32_t)take + padding_bits);
     if (bit_count < 56 || (bit_count < 64 && (accumulator >> bit_count) != 0)) return LZFSE_ZAZZCAT_CORRUPT;

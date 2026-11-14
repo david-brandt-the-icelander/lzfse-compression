@@ -2,6 +2,7 @@
 // paths, parallel chunks, decmpfs, statistics, round trips and hostile input. On macOS this also runs the Apple
 // interoperability tests (apple_tests.c, included below).
 #define _DARWIN_C_SOURCE // macOS: chflags, st_flags and extended attributes, used by the Apple tests
+#include "bare_functions.h"
 #include "bits.h"
 #include "copy.h"
 #include "format.h"
@@ -25,6 +26,11 @@ static lzfse_zazzcat_status decode_buffer(const void *stream, size_t n, size_t l
     return lzfse_zazzcat_decode(stream, n, limit, out);
 }
 
+// decode_buffer for callers that ignore the status (see src/bare_functions.h).
+static void bare_decode_buffer(const void *stream, size_t n, size_t limit, lzfse_zazzcat_buffer *out) {
+    (void)decode_buffer(stream, n, limit, out);
+}
+
 // Encode, decode in every way, check the results and return the stream (caller frees it).
 static lzfse_zazzcat_buffer round_trip(const void *data, size_t n) {
     lzfse_zazzcat_buffer encoded = encode_buffer(data, n), decoded = {0};
@@ -34,12 +40,12 @@ static lzfse_zazzcat_buffer round_trip(const void *data, size_t n) {
     CHECK(decode_buffer(encoded.data, encoded.length, n, &decoded) == LZFSE_ZAZZCAT_OK &&
               same_bytes(decoded.data, decoded.length, data, n),
           "decode of %zu bytes", n);
-    uint8_t *into = malloc(n + 10);
+    uint8_t *into = raw_malloc(n + 10);
     size_t written = 0;
     CHECK(lzfse_zazzcat_decode_into(encoded.data, encoded.length, into, n + 10, &written) == LZFSE_ZAZZCAT_OK &&
               same_bytes(into, written, data, n),
           "decode_into of %zu bytes", n);
-    free(into);
+    raw_free(into);
     lzfse_zazzcat_buffer_free(&decoded);
     return encoded;
 }
@@ -97,7 +103,7 @@ static void test_symbol_boundaries(void) {
 // A header with distinctive values in every field.
 static block_header sample_header(void) {
     block_header h;
-    memset(&h, 0, sizeof h);
+    clear_bytes(&h, sizeof h);
     h.decoded_size = 123456;
     h.literal_count = 40000;
     h.token_count = 9999;
@@ -125,16 +131,18 @@ static block_header sample_header(void) {
 
 static void test_headers_round_trip(void) {
     block_header h = sample_header(), back;
+    // The parsers set every field but not the struct's padding bytes, which compare_bytes also compares.
+    clear_bytes(&back, sizeof back);
     CHECK(block_header_validate(&h) == LZFSE_ZAZZCAT_OK, "sample header is valid");
     lzfse_zazzcat_buffer v2 = {0}, v1 = {0};
     size_t size = write_v2_header(&h, &v2), parsed_size = 0;
     CHECK(size == v2.length, "v2 size");
     CHECK(parse_v2_header(v2.data, v2.length, &back, &parsed_size) == LZFSE_ZAZZCAT_OK && parsed_size == size &&
-              memcmp(&back, &h, sizeof h) == 0,
+              compare_bytes(&back, &h, sizeof h) == 0,
           "v2 round trip");
     CHECK(write_v1_header(&h, &v1), "write v1");
     CHECK(parse_v1_header(v1.data, v1.length, &back, &parsed_size) == LZFSE_ZAZZCAT_OK &&
-              parsed_size == V1_HEADER_SIZE && memcmp(&back, &h, sizeof h) == 0,
+              parsed_size == V1_HEADER_SIZE && compare_bytes(&back, &h, sizeof h) == 0,
           "v1 round trip");
     lzfse_zazzcat_buffer_free(&v2);
     lzfse_zazzcat_buffer_free(&v1);
@@ -143,7 +151,7 @@ static void test_headers_round_trip(void) {
 static void test_bad_headers_are_errors(void) {
     block_header h = sample_header(), back;
     lzfse_zazzcat_buffer v2 = {0};
-    write_v2_header(&h, &v2);
+    bare_write_v2_header(&h, &v2);
     size_t size;
     for (size_t cut = 0; cut < v2.length; cut++) {
         CHECK(parse_v2_header(v2.data, cut, &back, &size) != LZFSE_ZAZZCAT_OK, "cut at %zu", cut);
@@ -153,7 +161,7 @@ static void test_bad_headers_are_errors(void) {
     store_u32(bad.data + 24, 5);
     CHECK(parse_v2_header(bad.data, bad.length, &back, &size) == LZFSE_ZAZZCAT_CORRUPT, "tiny size");
     lzfse_zazzcat_buffer longer = copy_of(v2.data, v2.length);
-    buffer_append(&longer, "", 1);
+    bare_buffer_append(&longer, "", 1);
     store_u32(longer.data + 24, (uint32_t)longer.length);
     CHECK(parse_v2_header(longer.data, longer.length, &back, &size) == LZFSE_ZAZZCAT_CORRUPT, "extra byte");
     h.literal_length_frequencies[0] = 65;
@@ -169,8 +177,8 @@ static void test_bits_read_back_in_reverse(void) {
     for (uint32_t extra = 0; extra < 16; extra++) {
         // 8 leading zero bytes, as the token stream has, so the reader may load bytes before the stream.
         lzfse_zazzcat_buffer out = {0};
-        buffer_reserve(&out, 4096);
-        memset(out.data, 0, 8);
+        bare_buffer_reserve(&out, 4096);
+        clear_bytes(out.data, 8);
         out.length = 8;
         bit_writer writer = {0, 0};
         uint32_t counts[200];
@@ -202,8 +210,8 @@ static void test_bit_reader_rejects_bad_starts(void) {
     CHECK(bit_reader_init(&r, top_bit, 8, -1) != LZFSE_ZAZZCAT_OK, "stray bit in the padding");
     CHECK(bit_reader_init(&r, below_top, 8, -1) == LZFSE_ZAZZCAT_OK, "bit just below the padding");
     REQUIRE(bit_reader_init(&r, zeros, 8, -1) == LZFSE_ZAZZCAT_OK, "init");
-    bit_reader_pull(&r, 32);
-    bit_reader_pull(&r, 31);
+    bare_bit_reader_pull(&r, 32);
+    bare_bit_reader_pull(&r, 31);
     CHECK(bit_reader_refill(&r) != LZFSE_ZAZZCAT_OK, "reading before the start");
 }
 
@@ -249,8 +257,8 @@ static void test_fse_literals_round_trip(void) {
         fse_encoder_entry encoder[256];
         fse_encoder_table(frequencies, symbol_counts[c], n, encoder);
         lzfse_zazzcat_buffer out = {0};
-        buffer_reserve(&out, 16000);
-        memset(out.data, 0, 8);
+        bare_buffer_reserve(&out, 16000);
+        clear_bytes(out.data, 8);
         out.length = 8;
         bit_writer writer = {0, 0};
         uint32_t state = 0;
@@ -261,8 +269,8 @@ static void test_fse_literals_round_trip(void) {
         int32_t padding = bit_writer_finish(&writer, &out);
         // Pad the frequencies to a full literal table so the literal decoder can read them.
         uint16_t literal_frequencies[256] = {0};
-        memcpy(literal_frequencies, frequencies, symbol_counts[c] * sizeof frequencies[0]);
-        fse_literal_entry *table = calloc(1024, sizeof *table);
+        copy_bytes(literal_frequencies, frequencies, symbol_counts[c] * sizeof frequencies[0]);
+        fse_literal_entry *table = raw_calloc(1024, sizeof *table);
         REQUIRE(fse_literal_table(literal_frequencies, n, table) == LZFSE_ZAZZCAT_OK, "table");
         bit_reader reader = {0};
         REQUIRE(bit_reader_init(&reader, out.data, out.length, padding) == LZFSE_ZAZZCAT_OK, "init");
@@ -275,7 +283,7 @@ static void test_fse_literals_round_trip(void) {
             }
         }
         CHECK(state == 0, "the decoder ends where the encoder started");
-        free(table);
+        raw_free(table);
         lzfse_zazzcat_buffer_free(&out);
     }
 }
@@ -285,7 +293,7 @@ static void test_single_symbol_uses_no_bits(void) {
     fse_encoder_entry encoder[4];
     fse_encoder_table(frequencies, 4, 64, encoder);
     lzfse_zazzcat_buffer out = {0};
-    buffer_reserve(&out, 64);
+    bare_buffer_reserve(&out, 64);
     bit_writer writer = {0, 0};
     uint32_t state = 0;
     for (int i = 0; i < 100; i++) fse_encode(&state, &encoder[2], &writer);
@@ -310,51 +318,56 @@ static void test_oversized_tables_are_rejected(void) {
 static size_t lzvn_round_trip(const uint8_t *data, size_t n) {
     lzfse_zazzcat_buffer encoded = {0};
     CHECK(lzfse_zazzcat_lzvn_encode(data, n, &encoded) == LZFSE_ZAZZCAT_OK, "encode");
-    uint8_t *decoded = malloc(n + 1);
+    uint8_t *decoded = raw_malloc(n + 1);
     CHECK(lzvn_decode_block(encoded.data, encoded.length, decoded, 0, n) == LZFSE_ZAZZCAT_OK &&
-              (n == 0 || memcmp(decoded, data, n) == 0),
+              (n == 0 || compare_bytes(decoded, data, n) == 0),
           "LZVN round trip of %zu bytes", n);
     size_t size = encoded.length;
-    free(decoded);
+    raw_free(decoded);
     lzfse_zazzcat_buffer_free(&encoded);
     return size;
 }
 
+// lzvn_round_trip for callers that ignore the payload size (see src/bare_functions.h).
+static void bare_lzvn_round_trip(const uint8_t *data, size_t n) {
+    (void)lzvn_round_trip(data, n);
+}
+
 static void test_lzvn_round_trips(void) {
-    lzvn_round_trip((const uint8_t *)"", 0);
-    lzvn_round_trip((const uint8_t *)"a", 1);
-    lzvn_round_trip((const uint8_t *)"abc", 3);
-    lzvn_round_trip((const uint8_t *)"hello hello hello hello world", 29);
+    bare_lzvn_round_trip((const uint8_t *)"", 0);
+    bare_lzvn_round_trip((const uint8_t *)"a", 1);
+    bare_lzvn_round_trip((const uint8_t *)"abc", 3);
+    bare_lzvn_round_trip((const uint8_t *)"hello hello hello hello world", 29);
     const char *line = "hello compressible text line\n";
     size_t line_length = strlen(line), text_length = line_length * 4000;
-    uint8_t *text = malloc(text_length);
-    for (size_t i = 0; i < 4000; i++) memcpy(text + i * line_length, line, line_length);
+    uint8_t *text = raw_malloc(text_length);
+    for (size_t i = 0; i < 4000; i++) copy_bytes(text + i * line_length, line, line_length);
     CHECK(lzvn_round_trip(text, text_length) < 2000, "repetitive text compresses");
-    free(text);
-    uint8_t *run = malloc(100000);
-    memset(run, 7, 100000);
-    lzvn_round_trip(run, 100000);
-    free(run);
+    raw_free(text);
+    uint8_t *run = raw_malloc(100000);
+    fill_bytes(run, 7, 100000);
+    bare_lzvn_round_trip(run, 100000);
+    raw_free(run);
     // Far distances: pieces of the start repeated after 70,000 noise bytes.
     size_t far_length = 70000 + 2990 + 2000;
-    uint8_t *far = malloc(far_length);
+    uint8_t *far = raw_malloc(far_length);
     for (uint32_t i = 0; i < 70000; i++) far[i] = (uint8_t)((i * 2654435761u) >> 13);
-    memcpy(far + 70000, far + 10, 2990);
-    memcpy(far + 72990, far + 60000, 2000);
-    lzvn_round_trip(far, far_length);
-    free(far);
+    copy_bytes(far + 70000, far + 10, 2990);
+    copy_bytes(far + 72990, far + 60000, 2000);
+    bare_lzvn_round_trip(far, far_length);
+    raw_free(far);
     uint8_t mixed[20000];
     for (uint32_t i = 0; i < 20000; i++) mixed[i] = i % 97 < 50 ? (uint8_t)(i % 7) : (uint8_t)(i * 31 % 251);
-    lzvn_round_trip(mixed, sizeof mixed);
+    bare_lzvn_round_trip(mixed, sizeof mixed);
 }
 
 static void test_lzvn_bad_streams_are_errors(void) {
     const char *phrase = "abcabcabcabcabcabc xyz xyz xyz";
     size_t phrase_length = strlen(phrase);
     uint8_t text[30 * 20];
-    for (int i = 0; i < 20; i++) memcpy(text + i * phrase_length, phrase, phrase_length);
+    for (int i = 0; i < 20; i++) copy_bytes(text + i * phrase_length, phrase, phrase_length);
     lzfse_zazzcat_buffer encoded = {0};
-    lzfse_zazzcat_lzvn_encode(text, 20 * phrase_length, &encoded);
+    bare_lzfse_zazzcat_lzvn_encode(text, 20 * phrase_length, &encoded);
     uint8_t out[1000];
     size_t written;
     for (size_t cut = 0; cut < encoded.length; cut++) {
@@ -397,7 +410,7 @@ static void test_copy_match_exact(void) {
             for (int i = 0; i < 100; i++) a[i] = b[i] = (uint8_t)i;
             copy_match_exact(a, 100, d, m);
             for (size_t i = 0; i < m; i++) b[100 + i] = b[100 + i - d];
-            CHECK(memcmp(a, b, sizeof a) == 0, "d=%zu m=%zu", d, m);
+            CHECK(compare_bytes(a, b, sizeof a) == 0, "d=%zu m=%zu", d, m);
         }
     }
 }
@@ -408,7 +421,7 @@ static void test_wild_copy(void) {
     for (size_t n = 0; n < 90; n++) {
         uint8_t destination[120] = {0};
         wild_copy(destination + 3, source + 5, n);
-        CHECK(memcmp(destination + 3, source + 5, n) == 0, "n=%zu", n);
+        CHECK(compare_bytes(destination + 3, source + 5, n) == 0, "n=%zu", n);
         // Nothing beyond the 15-byte slack is touched (steps of 16 from the start, the first always runs).
         size_t touched = n == 0 ? 16 : (n + 15) / 16 * 16;
         for (size_t i = 3 + touched; i < 120; i++) CHECK(destination[i] == 0, "n=%zu wrote at %zu", n, i);
@@ -426,19 +439,20 @@ static void test_decode_token_fast_matches_reference(void) {
                 size_t l = literal_lengths[li], m = match_lengths[mi];
                 uint8_t a[360] = {0}, before[360], want[360];
                 for (int i = 0; i < 60; i++) a[i] = (uint8_t)i;
-                memcpy(before, a, sizeof a);
+                copy_bytes(before, a, sizeof a);
                 bool done = decode_token_fast(a, sizeof a, 60, literals, sizeof literals, 5, l, d, m);
                 if (d < 8 && m > 64) {
-                    CHECK(!done && memcmp(a, before, sizeof a) == 0, "d=%zu l=%zu m=%zu should decline", d, l, m);
+                    CHECK(!done && compare_bytes(a, before, sizeof a) == 0, "d=%zu l=%zu m=%zu should decline", d, l,
+                          m);
                     continue;
                 }
                 CHECK(done, "d=%zu l=%zu m=%zu", d, l, m);
-                memcpy(want, before, sizeof want);
-                memcpy(want + 60, literals + 5, l);
+                copy_bytes(want, before, sizeof want);
+                copy_bytes(want + 60, literals + 5, l);
                 for (size_t i = 0; i < m; i++) want[60 + l + i] = want[60 + l + i - d];
                 size_t end = 60 + l + m;
-                CHECK(memcmp(a, want, end) == 0, "d=%zu l=%zu m=%zu", d, l, m);
-                CHECK(memcmp(a + end + 16, before + end + 16, sizeof a - end - 16) == 0,
+                CHECK(compare_bytes(a, want, end) == 0, "d=%zu l=%zu m=%zu", d, l, m);
+                CHECK(compare_bytes(a + end + 16, before + end + 16, sizeof a - end - 16) == 0,
                       "wrote past the slack: d=%zu l=%zu m=%zu", d, l, m);
             }
         }
@@ -449,7 +463,7 @@ static void test_decode_token_fast_matches_reference(void) {
     CHECK(!decode_token_fast(out, 100, 10, literals, 120, 0, 2, 13, 4), "distance before the start");
     CHECK(!decode_token_fast(out, 100, 60, literals, 120, 0, 2, 5, 10), "output too short");
     CHECK(!decode_token_fast(out, 100, 10, literals, 120, 110, 2, 5, 4), "literals too short");
-    CHECK(memcmp(out, zeros, sizeof out) == 0, "nothing written when declining");
+    CHECK(compare_bytes(out, zeros, sizeof out) == 0, "nothing written when declining");
 }
 
 // --- Whole streams ---
@@ -488,11 +502,11 @@ static void test_sizes_and_block_types(void) {
 }
 
 static void test_compressible_inputs(void) {
-    uint8_t *zeros = calloc(1000000, 1);
+    uint8_t *zeros = raw_calloc(1000000, 1);
     lzfse_zazzcat_buffer stream = round_trip(zeros, 1000000);
     CHECK(stream.length < 2000, "a million zeros in %zu bytes", stream.length);
     lzfse_zazzcat_buffer_free(&stream);
-    free(zeros);
+    raw_free(zeros);
     lzfse_zazzcat_buffer text = words(500000);
     stream = round_trip(text.data, text.length);
     CHECK(stream.length < text.length / 3, "%zu of %zu", stream.length, text.length);
@@ -500,12 +514,12 @@ static void test_compressible_inputs(void) {
     lzfse_zazzcat_buffer_free(&text);
     const char *line = "hello compressible text line\n";
     size_t line_length = strlen(line);
-    uint8_t *repeated = malloc(line_length * 40000);
-    for (int i = 0; i < 40000; i++) memcpy(repeated + i * line_length, line, line_length);
+    uint8_t *repeated = raw_malloc(line_length * 40000);
+    for (int i = 0; i < 40000; i++) copy_bytes(repeated + i * line_length, line, line_length);
     stream = round_trip(repeated, line_length * 40000);
     CHECK(stream.length < 5000, "%zu", stream.length);
     lzfse_zazzcat_buffer_free(&stream);
-    free(repeated);
+    raw_free(repeated);
 }
 
 static void test_block_limits(void) {
@@ -513,14 +527,14 @@ static void test_block_limits(void) {
     lzfse_zazzcat_buffer r = noise(400000, 7);
     lzfse_zazzcat_buffer data = {0};
     for (int i = 0; i < 60000; i++) {
-        buffer_append(&data, r.data + i * 5, 3);
-        buffer_append(&data, "abcd", 4);
+        bare_buffer_append(&data, r.data + i * 5, 3);
+        bare_buffer_append(&data, "abcd", 4);
     }
     lzfse_zazzcat_buffer stream = round_trip(data.data, data.length);
     lzfse_zazzcat_buffer_free(&stream);
     // Mostly literals fill blocks to their literal limit.
     lzfse_zazzcat_buffer heavy = noise(300000, 9);
-    for (size_t i = 0; i + 100 < heavy.length; i += 1000) memmove(heavy.data + i + 500, heavy.data + i, 8);
+    for (size_t i = 0; i + 100 < heavy.length; i += 1000) move_bytes(heavy.data + i + 500, heavy.data + i, 8);
     stream = round_trip(heavy.data, heavy.length);
     lzfse_zazzcat_buffer_free(&stream);
     lzfse_zazzcat_buffer_free(&r);
@@ -530,12 +544,12 @@ static void test_block_limits(void) {
 
 static void test_far_matches(void) {
     lzfse_zazzcat_buffer data = noise(300000, 3);
-    buffer_reserve(&data, 30000);
+    bare_buffer_reserve(&data, 30000);
     size_t length = data.length;
     // A copy from exactly the maximum distance back, then one from the start.
-    memcpy(data.data + length, data.data + length - MAX_DISTANCE, 5000);
+    copy_bytes(data.data + length, data.data + length - MAX_DISTANCE, 5000);
     data.length += 5000;
-    memcpy(data.data + data.length, data.data + 10, 19990);
+    copy_bytes(data.data + data.length, data.data + 10, 19990);
     data.length += 19990;
     lzfse_zazzcat_buffer stream = round_trip(data.data, data.length);
     CHECK(stream.length < data.length, "far repeats are found");
@@ -575,11 +589,11 @@ static void test_v1_headers_decode(void) {
     REQUIRE(size + payload == stream.length - 4, "one block then the end marker");
     // Rewrite the block with a v1 header and the same payload.
     lzfse_zazzcat_buffer v1 = {0}, decoded = {0};
-    write_v1_header(&h, &v1);
-    buffer_append(&v1, stream.data + size, payload);
+    bare_write_v1_header(&h, &v1);
+    bare_buffer_append(&v1, stream.data + size, payload);
     uint8_t end[4];
     store_u32(end, MAGIC_END_OF_STREAM);
-    buffer_append(&v1, end, 4);
+    bare_buffer_append(&v1, end, 4);
     CHECK(decode_buffer(v1.data, v1.length, data.length, &decoded) == LZFSE_ZAZZCAT_OK &&
               same_bytes(decoded.data, decoded.length, data.data, data.length),
           "v1 decode");
@@ -594,8 +608,8 @@ static void test_multi_block_streams(void) {
     lzfse_zazzcat_buffer a = encode_buffer(text.data, text.length), b = encode_buffer(tail.data, tail.length);
     // The first stream without its end marker, then the second: one stream of both.
     lzfse_zazzcat_buffer joined = copy_of(a.data, a.length - 4), want = copy_of(text.data, text.length);
-    buffer_append(&joined, b.data, b.length);
-    buffer_append(&want, tail.data, tail.length);
+    bare_buffer_append(&joined, b.data, b.length);
+    bare_buffer_append(&want, tail.data, tail.length);
     lzfse_zazzcat_buffer decoded = {0};
     CHECK(decode_buffer(joined.data, joined.length, want.length, &decoded) == LZFSE_ZAZZCAT_OK &&
               same_bytes(decoded.data, decoded.length, want.data, want.length),
@@ -606,7 +620,7 @@ static void test_multi_block_streams(void) {
 
 static void test_hostile_input(void) {
     lzfse_zazzcat_buffer data = words(20000), stream = encode_buffer(data.data, data.length), out = {0};
-    uint8_t *buffer = malloc(data.length);
+    uint8_t *buffer = raw_malloc(data.length);
     size_t written;
     for (size_t cut = 0; cut < stream.length; cut += 37) {
         CHECK(decode_buffer(stream.data, cut, SIZE_MAX, &out) != LZFSE_ZAZZCAT_OK, "cut at %zu", cut);
@@ -618,8 +632,8 @@ static void test_hostile_input(void) {
         for (int f = 0; f < 3; f++) {
             lzfse_zazzcat_buffer bad = copy_of(stream.data, stream.length);
             bad.data[i] ^= flips[f];
-            decode_buffer(bad.data, bad.length, 1 << 20, &out);
-            lzfse_zazzcat_decode_into(bad.data, bad.length, buffer, data.length, &written);
+            bare_decode_buffer(bad.data, bad.length, 1 << 20, &out);
+            bare_lzfse_zazzcat_decode_into(bad.data, bad.length, buffer, data.length, &written);
             lzfse_zazzcat_buffer_free(&bad);
         }
     }
@@ -627,8 +641,8 @@ static void test_hostile_input(void) {
     for (uint32_t seed = 0; seed < 200; seed++) {
         lzfse_zazzcat_buffer junk = noise(64 + seed * 3, seed);
         store_u32(junk.data, magics[seed % 4]);
-        decode_buffer(junk.data, junk.length, 1 << 20, &out);
-        lzfse_zazzcat_decode_into(junk.data, junk.length, buffer, data.length, &written);
+        bare_decode_buffer(junk.data, junk.length, 1 << 20, &out);
+        bare_lzfse_zazzcat_decode_into(junk.data, junk.length, buffer, data.length, &written);
         lzfse_zazzcat_buffer_free(&junk);
     }
     CHECK(decode_buffer(stream.data, stream.length, data.length - 1, &out) == LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL, "limit");
@@ -638,7 +652,7 @@ static void test_hostile_input(void) {
           "small buffer");
     CHECK(decode_buffer("bvx?", 4, 10, &out) == LZFSE_ZAZZCAT_CORRUPT, "unknown magic");
     CHECK(decode_buffer("bv", 2, 10, &out) == LZFSE_ZAZZCAT_TRUNCATED, "truncated magic");
-    free(buffer);
+    raw_free(buffer);
     lzfse_zazzcat_buffer_free(&data);
     lzfse_zazzcat_buffer_free(&stream);
     lzfse_zazzcat_buffer_free(&out);
@@ -655,7 +669,7 @@ static void test_random_round_trips(void) {
             for (size_t i = 0; i < n; i++) piece.data[i] %= 4;
         }
         lzfse_zazzcat_buffer data = copy_of(piece.data, piece.length);
-        for (uint32_t k = test_random_next(&r) % 4; k > 0; k--) buffer_append(&data, piece.data, piece.length);
+        for (uint32_t k = test_random_next(&r) % 4; k > 0; k--) bare_buffer_append(&data, piece.data, piece.length);
         lzfse_zazzcat_buffer stream = round_trip(data.data, data.length);
         lzfse_zazzcat_buffer_free(&stream);
         lzfse_zazzcat_buffer_free(&data);
@@ -671,7 +685,7 @@ static void test_random_input_never_crashes(void) {
         lzfse_zazzcat_buffer junk = noise(test_random_next(&r) % 4000, test_random_next(&r));
         uint32_t pick = test_random_next(&r) % 5;
         if (junk.length >= 4 && pick < 4) store_u32(junk.data, magics[pick]);
-        decode_buffer(junk.data, junk.length, 1 << 20, &out);
+        bare_decode_buffer(junk.data, junk.length, 1 << 20, &out);
         lzfse_zazzcat_buffer_free(&junk);
     }
     lzfse_zazzcat_buffer_free(&out);
@@ -683,14 +697,14 @@ static void test_small_path_boundaries(void) {
     size_t sizes[] = {4096, 8192, 8193, 16384, 16385, 32768, 32769, 65535, 65536, 65537};
     for (int s = 0; s < 10; s++) {
         size_t n = sizes[s], quarter = n / 4;
-        uint8_t *data = malloc(n);
+        uint8_t *data = raw_malloc(n);
         for (uint32_t j = 0; j < n; j++) data[j] = (uint8_t)((j * 2654435761u) >> 13);
         // The last quarter repeats the first, so a match must reach across the whole input.
-        memcpy(data + n - quarter, data, quarter);
+        copy_bytes(data + n - quarter, data, quarter);
         lzfse_zazzcat_buffer stream = round_trip(data, n);
         CHECK(stream.length < n - quarter + n / 16, "size %zu: far repeat missed", n);
         lzfse_zazzcat_buffer_free(&stream);
-        free(data);
+        raw_free(data);
     }
 }
 
@@ -698,21 +712,21 @@ static void test_reused_encoder_matches_fresh(void) {
     lzfse_zazzcat_encoder *encoder = lzfse_zazzcat_encoder_create(NULL);
     for (uint32_t i = 0; i < 40; i++) {
         size_t n = 5000 + i * 997;
-        uint8_t *data = malloc(n);
+        uint8_t *data = raw_malloc(n);
         for (uint32_t j = 0; j < n; j++) data[j] = (uint8_t)(((j * (i + 3)) % 251) ^ (j / 13));
         lzfse_zazzcat_buffer reused = {0}, fresh = encode_buffer(data, n);
         CHECK(lzfse_zazzcat_encoder_encode(encoder, data, n, &reused) == LZFSE_ZAZZCAT_OK, "encode");
         CHECK(same_bytes(reused.data, reused.length, fresh.data, fresh.length), "input %u", i);
         lzfse_zazzcat_buffer_free(&reused);
         lzfse_zazzcat_buffer_free(&fresh);
-        free(data);
+        raw_free(data);
     }
     lzfse_zazzcat_encoder_destroy(encoder);
 }
 
 static void test_chunks_round_trip_in_order(void) {
     size_t n = 300000;
-    uint8_t *data = malloc(n);
+    uint8_t *data = raw_malloc(n);
     for (uint32_t i = 0; i < n; i++) data[i] = (uint8_t)(((i / 3) % 251) ^ (i % 7));
     lzfse_zazzcat_buffer out = copy_of("prefix", 6), decoded = {0};
     lzfse_zazzcat_offsets offsets = {0};
@@ -736,7 +750,7 @@ static void test_chunks_round_trip_in_order(void) {
     lzfse_zazzcat_buffer_free(&decoded);
     lzfse_zazzcat_buffer_free(&empty);
     lzfse_zazzcat_offsets_free(&offsets);
-    free(data);
+    raw_free(data);
 }
 
 // --- decmpfs and statistics ---
@@ -744,7 +758,7 @@ static void test_chunks_round_trip_in_order(void) {
 static void test_decmpfs_layouts_round_trip(void) {
     const char *phrase = "tiny file contents ";
     lzfse_zazzcat_buffer small = {0}, out = {0};
-    for (int i = 0; i < 20; i++) buffer_append(&small, phrase, strlen(phrase));
+    for (int i = 0; i < 20; i++) bare_buffer_append(&small, phrase, strlen(phrase));
     lzfse_zazzcat_decmpfs c;
     REQUIRE(lzfse_zazzcat_decmpfs_compress(small.data, small.length, &c) == LZFSE_ZAZZCAT_OK, "compress");
     uint32_t type;
@@ -758,10 +772,10 @@ static void test_decmpfs_layouts_round_trip(void) {
           "inline round trip");
     lzfse_zazzcat_decmpfs_free(&c);
     size_t n = 200000;
-    uint8_t *big = malloc(n);
+    uint8_t *big = raw_malloc(n);
     for (uint32_t i = 0; i < n; i++) big[i] = (uint8_t)(i % 13 * (i / 1000 % 7));
     REQUIRE(lzfse_zazzcat_decmpfs_compress(big, n, &c) == LZFSE_ZAZZCAT_OK, "compress");
-    lzfse_zazzcat_decmpfs_parse_header(c.xattr.data, c.xattr.length, &type, &size);
+    bare_lzfse_zazzcat_decmpfs_parse_header(c.xattr.data, c.xattr.length, &type, &size);
     CHECK(type == LZFSE_ZAZZCAT_DECMPFS_LZFSE_FORK, "large files go in the resource fork");
     CHECK(load_u32(c.fork.data) == 20, "4 chunks need 5 offsets");
     out.length = 0;
@@ -778,13 +792,13 @@ static void test_decmpfs_layouts_round_trip(void) {
     lzfse_zazzcat_decmpfs_free(&c);
     lzfse_zazzcat_buffer_free(&small);
     lzfse_zazzcat_buffer_free(&out);
-    free(big);
+    raw_free(big);
 }
 
 static void test_stats_totals_match_the_input(void) {
     const char *phrase = "the quick brown fox jumps over the lazy dog ";
     lzfse_zazzcat_buffer text = {0};
-    while (text.length < 300000) buffer_append(&text, phrase, strlen(phrase));
+    while (text.length < 300000) bare_buffer_append(&text, phrase, strlen(phrase));
     text.length = 300000;
     lzfse_zazzcat_buffer random = noise(20000, 5);
     struct {
@@ -795,7 +809,7 @@ static void test_stats_totals_match_the_input(void) {
     for (int c = 0; c < 4; c++) {
         lzfse_zazzcat_buffer stream = encode_buffer(cases[c].data, cases[c].length);
         lzfse_zazzcat_stream_stats s;
-        memset(&s, 0, sizeof s);
+        clear_bytes(&s, sizeof s);
         CHECK(lzfse_zazzcat_stream_stats_add(&s, stream.data, stream.length) == LZFSE_ZAZZCAT_OK, "stats");
         CHECK(s.decoded_bytes == cases[c].length && s.stored_bytes == stream.length, "case %d totals", c);
         CHECK(s.header_bytes + s.literal_bytes + s.match_stream_bytes + s.other_block_bytes + 4 == s.stored_bytes,
@@ -851,9 +865,9 @@ int main(void) {
     RUN_TEST(test_stats_totals_match_the_input);
     run_apple_tests();
     if (test_failures) {
-        printf("%d check(s) failed\n", test_failures);
+        bare_printf("%d check(s) failed\n", test_failures);
         return 1;
     }
-    printf("all tests passed\n");
+    bare_printf("all tests passed\n");
     return 0;
 }

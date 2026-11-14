@@ -151,7 +151,7 @@ lzfse_zazzcat_status encode_small(const uint8_t *source, size_t length, small_fi
         first.values[k] = load_u32(source);
     }
     for (size_t i = 0; i < bucket_count; i++) tables->buckets[i] = first;
-    memset(tables->long_slots, 0, long_count * sizeof *tables->long_slots);
+    clear_bytes(tables->long_slots, long_count * sizeof *tables->long_slots);
     small_finder finder = {source, length, tables->buckets, tables->long_slots, options->good_match};
     switch (bits) {
     case 10:

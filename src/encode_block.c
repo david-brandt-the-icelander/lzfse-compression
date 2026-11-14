@@ -54,10 +54,21 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
 
     // Count symbol occurrences, then scale them into FSE frequencies.
     block_header header;
-    memset(&header, 0, sizeof header);
+    // Not cleared: fse_normalize below writes all four frequency tables, and every scalar field is set here.
+    // The stream sizes, padding and final states are only known at the end, but write_v2_header reads them
+    // first (for the placeholder fixed fields), so they start at 0 and write_v2_fixed_fields rewrites them.
+    // clear_bytes(&header, sizeof header);
     header.decoded_size = (uint32_t)blocks->covered_bytes;
     header.literal_count = (uint32_t)literal_count;
     header.token_count = (uint32_t)token_count;
+    header.literal_payload_size = 0;
+    header.token_payload_size = 0;
+    header.literal_padding_bits = 0;
+    header.token_padding_bits = 0;
+    for (int i = 0; i < 4; i++) header.literal_states[i] = 0;
+    header.literal_length_state = 0;
+    header.match_length_state = 0;
+    header.distance_state = 0;
     uint32_t literal_counts[LITERAL_SYMBOLS] = {0};
     for (size_t i = 0; i < literal_count; i++) literal_counts[literals[i]]++;
     uint32_t literal_length_counts[LITERAL_LENGTH_SYMBOLS] = {0};
@@ -115,7 +126,7 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     // Tokens: 8 zero bytes first, then each token (last first) as distance, match length and literal length,
     // each with its extra bits written before its state bits.
     size_t token_stream_start = output->length;
-    memset(output->data + output->length, 0, 8);
+    clear_bytes(output->data + output->length, 8);
     output->length += 8;
     writer = (bit_writer){0, 0};
     uint32_t literal_length_state = 0, match_length_state = 0, distance_state = 0;
@@ -152,8 +163,7 @@ void block_writer_flush(block_writer *blocks, const uint8_t *source, lzfse_zazzc
             // Not smaller than storing the bytes as they are: replace the block with a raw one.
             output->length = mark;
             if (buffer_reserve(output, blocks->covered_bytes + UNCOMPRESSED_HEADER_SIZE)) {
-                buffer_push_u32_reserved(output, MAGIC_UNCOMPRESSED);
-                buffer_push_u32_reserved(output, (uint32_t)blocks->covered_bytes);
+                buffer_push_u32_x2_reserved(output, MAGIC_UNCOMPRESSED, (uint32_t)blocks->covered_bytes);
                 buffer_append_reserved(output, source + blocks->block_start, blocks->covered_bytes);
             } else {
                 blocks->status = LZFSE_ZAZZCAT_OUT_OF_MEMORY;

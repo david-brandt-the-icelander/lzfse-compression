@@ -10,7 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bare_functions.h"
 #include "lzfse_zazzcat.h"
+#include "memory_allocation.h"
+#include "memory_operations.h"
 
 // Number of failed checks so far, and the name of the running test.
 static int test_failures;
@@ -21,9 +24,9 @@ static const char *test_name;
     do {                                                                                                               \
         if (!(condition)) {                                                                                            \
             test_failures++;                                                                                           \
-            fprintf(stderr, "FAILED %s (%s:%d): %s: ", test_name, __FILE__, __LINE__, #condition);                     \
-            fprintf(stderr, __VA_ARGS__);                                                                              \
-            fprintf(stderr, "\n");                                                                                     \
+            bare_fprintf(stderr, "FAILED %s (%s:%d): %s: ", test_name, __FILE__, __LINE__, #condition);                \
+            bare_fprintf(stderr, __VA_ARGS__);                                                                         \
+            bare_fprintf(stderr, "\n");                                                                                \
         }                                                                                                              \
     } while (0)
 
@@ -41,7 +44,7 @@ static const char *test_name;
         test_name = #function;                                                                                         \
         int failures_before = test_failures;                                                                           \
         function();                                                                                                    \
-        printf("%s %s\n", test_failures == failures_before ? "ok  " : "FAIL", #function);                              \
+        bare_printf("%s %s\n", test_failures == failures_before ? "ok  " : "FAIL", #function);                         \
     } while (0)
 
 // A deterministic pseudo-random number generator (xorshift), so every run sees the same data.
@@ -61,7 +64,7 @@ static inline uint32_t test_random_next(test_random *r) {
 
 // Fill a new buffer with `n` pseudo-random bytes (incompressible "noise").
 static inline lzfse_zazzcat_buffer noise(size_t n, uint32_t seed) {
-    lzfse_zazzcat_buffer out = {malloc(n + 1), n, n + 1};
+    lzfse_zazzcat_buffer out = {raw_malloc(n + 1), n, n + 1};
     test_random r = {seed | 1};
     for (size_t i = 0; i < n; i++) out.data[i] = (uint8_t)test_random_next(&r);
     return out;
@@ -71,12 +74,12 @@ static inline lzfse_zazzcat_buffer noise(size_t n, uint32_t seed) {
 static inline lzfse_zazzcat_buffer words(size_t n) {
     static const char *vocabulary[] = {"lorem ",       "ipsum ",      "dolor ",  "sit ", "amet, ",
                                        "consectetur ", "adipiscing ", "elit.\n", "sed ", "do "};
-    lzfse_zazzcat_buffer out = {malloc(n + 16), 0, n + 16};
+    lzfse_zazzcat_buffer out = {raw_malloc(n + 16), 0, n + 16};
     test_random r = {99};
     while (out.length < n) {
         const char *word = vocabulary[(uint8_t)test_random_next(&r) % 10];
         size_t length = strlen(word);
-        memcpy(out.data + out.length, word, length);
+        copy_bytes(out.data + out.length, word, length);
         out.length += length;
     }
     out.length = n;
@@ -85,14 +88,14 @@ static inline lzfse_zazzcat_buffer words(size_t n) {
 
 // A buffer holding a copy of `n` bytes.
 static inline lzfse_zazzcat_buffer copy_of(const void *data, size_t n) {
-    lzfse_zazzcat_buffer out = {malloc(n + 1), n, n + 1};
-    if (n > 0) memcpy(out.data, data, n);
+    lzfse_zazzcat_buffer out = {raw_malloc(n + 1), n, n + 1};
+    if (n > 0) copy_bytes(out.data, data, n);
     return out;
 }
 
 // True when two byte ranges are equal (and of equal length).
 static inline int same_bytes(const void *a, size_t a_length, const void *b, size_t b_length) {
-    return a_length == b_length && (a_length == 0 || memcmp(a, b, a_length) == 0);
+    return a_length == b_length && (a_length == 0 || compare_bytes(a, b, a_length) == 0);
 }
 
 #endif

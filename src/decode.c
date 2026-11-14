@@ -116,10 +116,10 @@ static COLD lzfse_zazzcat_status decode_token_slow(uint8_t *output, size_t outpu
     if (match_start > output_capacity || length > output_capacity - match_start) {
         return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
     }
-    memcpy(output + position, literals, literal_length);
+    copy_bytes(output + position, literals, literal_length);
     if (distance == 1) {
         // A run of one byte (zeros, padding): memset speed.
-        memset(output + match_start, output[match_start - 1], length);
+        fill_bytes(output + match_start, output[match_start - 1], length);
     } else {
         copy_match_exact(output, match_start, distance, length);
     }
@@ -206,7 +206,7 @@ static lzfse_zazzcat_status decode_with(lzfse_zazzcat_decoder *d, const uint8_t 
             size_t body = offset + UNCOMPRESSED_HEADER_SIZE;
             if (block_decoded > source_length - body) return LZFSE_ZAZZCAT_TRUNCATED;
             if (block_decoded > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
-            memcpy(output + position, source + body, block_decoded);
+            copy_bytes(output + position, source + body, block_decoded);
             position += block_decoded;
             offset = body + block_decoded;
         } else if (magic == MAGIC_LZVN) {
@@ -251,7 +251,12 @@ lzfse_zazzcat_status lzfse_zazzcat_decode_into(const void *source, size_t source
                                                size_t destination_capacity, size_t *decoded_length) {
     // The tables (about 7 KB) live on the stack; only the literal buffer is allocated.
     lzfse_zazzcat_decoder decoder;
-    memset(&decoder, 0, sizeof decoder);
+    // Not cleared: only the literal buffer fields need a starting value. The FSE tables are rebuilt by
+    // fse_literal_table and fse_value_table for every LZFSE block before anything reads them, and streams of
+    // LZVN or uncompressed blocks never read them at all.
+    // clear_bytes(&decoder, sizeof decoder);
+    decoder.literals = NULL;
+    decoder.literals_capacity = 0;
     lzfse_zazzcat_status status =
         decode_with(&decoder, source, source_length, destination, destination_capacity, decoded_length);
     zz_free(decoder.literals);

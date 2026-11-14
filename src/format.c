@@ -1,5 +1,6 @@
 // Value tables and block header parsing and writing.
 #include "format.h"
+#include "buffer.h"
 
 const uint8_t literal_length_extra_bits[LITERAL_LENGTH_SYMBOLS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                                                    0, 0, 0, 0, 0, 0, 2, 3, 5, 8};
@@ -61,7 +62,9 @@ lzfse_zazzcat_status block_header_validate(const block_header *h) {
 lzfse_zazzcat_status parse_v1_header(const uint8_t *source, size_t source_length, block_header *h,
                                      size_t *header_size) {
     if (source_length < V1_HEADER_SIZE) return LZFSE_ZAZZCAT_TRUNCATED;
-    memset(h, 0, sizeof *h);
+    // Not cleared: every field, including all four frequency tables, is read from the header below. Callers use
+    // `h` only when this returns OK.
+    // clear_bytes(h, sizeof *h);
     h->decoded_size = load_u32(source + 4);
     uint32_t payload_size = load_u32(source + 8);
     h->literal_count = load_u32(source + 12);
@@ -71,9 +74,7 @@ lzfse_zazzcat_status parse_v1_header(const uint8_t *source, size_t source_length
     h->literal_padding_bits = (int32_t)load_u32(source + 28);
     for (int i = 0; i < 4; i++) h->literal_states[i] = load_u16(source + 32 + 2 * i);
     h->token_padding_bits = (int32_t)load_u32(source + 40);
-    h->literal_length_state = load_u16(source + 44);
-    h->match_length_state = load_u16(source + 46);
-    h->distance_state = load_u16(source + 48);
+    load_u16_x3(source + 44, &h->literal_length_state, &h->match_length_state, &h->distance_state);
     frequency_tables tables = frequency_tables_of(h);
     size_t offset = 50;
     for (int t = 0; t < 4; t++) {
@@ -156,7 +157,10 @@ lzfse_zazzcat_status parse_v2_header(const uint8_t *source, size_t source_length
     size_t size = bit_field(word2, 0, 32);
     if (size < V2_FIXED_HEADER_SIZE) return LZFSE_ZAZZCAT_CORRUPT;
     if (size > source_length) return LZFSE_ZAZZCAT_TRUNCATED;
-    memset(h, 0, sizeof *h);
+    // Not cleared: every scalar field is read from the fixed header below, and the frequency loop sets every
+    // frequency. Only a header without tables leaves the frequencies unset, so that case zeroes them itself.
+    // Callers use `h` only when this returns OK.
+    // clear_bytes(h, sizeof *h);
     h->decoded_size = load_u32(source + 4);
     h->literal_count = bit_field(word0, 0, 20);
     h->literal_payload_size = bit_field(word0, 20, 20);
@@ -172,11 +176,14 @@ lzfse_zazzcat_status parse_v2_header(const uint8_t *source, size_t source_length
     // A header without tables leaves every frequency at zero.
     const uint8_t *tables_start = source + V2_FIXED_HEADER_SIZE;
     size_t tables_length = size - V2_FIXED_HEADER_SIZE;
-    if (tables_length == 0) return LZFSE_ZAZZCAT_OK;
+    frequency_tables tables = frequency_tables_of(h);
+    if (tables_length == 0) {
+        for (int t = 0; t < 4; t++) clear_bytes(tables.table[t], tables.count[t] * sizeof *tables.table[t]);
+        return LZFSE_ZAZZCAT_OK;
+    }
     // Read the variable-length frequency codes through a 32-bit accumulator, least significant bits first.
     uint32_t accumulator = 0, available_bits = 0;
     size_t next_byte = 0;
-    frequency_tables tables = frequency_tables_of(h);
     for (int t = 0; t < 4; t++) {
         for (size_t i = 0; i < tables.count[t]; i++) {
             while (next_byte < tables_length && available_bits + 8 <= 32) {
@@ -199,7 +206,9 @@ size_t write_v2_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     // At most 14 bits per frequency, plus the fixed fields.
     if (!buffer_reserve(output, V2_FIXED_HEADER_SIZE + FREQUENCY_COUNT * 14 / 8 + 2)) return 0;
     size_t start = output->length;
-    memset(output->data + start, 0, V2_FIXED_HEADER_SIZE);
+    // Not cleared: this placeholder is reserved space, and write_v2_fixed_fields below overwrites all 32 bytes
+    // (magic, decoded size and three 64-bit words) before the header is returned.
+    // clear_bytes(output->data + start, V2_FIXED_HEADER_SIZE);
     output->length += V2_FIXED_HEADER_SIZE;
     uint32_t accumulator = 0, pending_bits = 0;
     frequency_tables tables = frequency_tables_of(h);
@@ -234,27 +243,26 @@ void write_v2_fixed_fields(const block_header *h, uint32_t header_size, uint8_t 
                      place(h->token_payload_size, 40) | place((uint32_t)(h->token_padding_bits + 7), 60);
     uint64_t word2 = place(header_size, 0) | place(h->literal_length_state, 32) | place(h->match_length_state, 42) |
                      place(h->distance_state, 52);
-    store_u32(fixed, MAGIC_LZFSE_V2);
-    store_u32(fixed + 4, h->decoded_size);
-    store_u64(fixed + 8, word0);
-    store_u64(fixed + 16, word1);
-    store_u64(fixed + 24, word2);
+    store_u32_x2(fixed, MAGIC_LZFSE_V2, h->decoded_size);
+    store_u64_x3(fixed + 8, word0, word1, word2);
 }
 
 bool write_v1_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     if (!buffer_reserve(output, V1_HEADER_SIZE)) return false;
     uint8_t *out = output->data + output->length;
-    memset(out, 0, V1_HEADER_SIZE);
-    uint32_t fields[7] = {MAGIC_LZFSE_V1,       h->decoded_size, h->literal_payload_size + h->token_payload_size,
-                          h->literal_count,     h->token_count,  h->literal_payload_size,
-                          h->token_payload_size};
-    for (int i = 0; i < 7; i++) store_u32(out + 4 * i, fields[i]);
-    store_u32(out + 28, (uint32_t)h->literal_padding_bits);
+    clear_bytes(out, V1_HEADER_SIZE);
+    uint32_t fields[8] = {MAGIC_LZFSE_V1,
+                          h->decoded_size,
+                          h->literal_payload_size + h->token_payload_size,
+                          h->literal_count,
+                          h->token_count,
+                          h->literal_payload_size,
+                          h->token_payload_size,
+                          (uint32_t)h->literal_padding_bits};
+    for (int i = 0; i < 8; i++) store_u32(out + 4 * i, fields[i]);
     for (int i = 0; i < 4; i++) store_u16(out + 32 + 2 * i, h->literal_states[i]);
     store_u32(out + 40, (uint32_t)h->token_padding_bits);
-    store_u16(out + 44, h->literal_length_state);
-    store_u16(out + 46, h->match_length_state);
-    store_u16(out + 48, h->distance_state);
+    store_u16_x3(out + 44, h->literal_length_state, h->match_length_state, h->distance_state);
     frequency_tables tables = frequency_tables_of(h);
     size_t offset = 50;
     for (int t = 0; t < 4; t++) {

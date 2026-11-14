@@ -1,0 +1,17 @@
+{
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/include",
+    "${workspaceFolder}/src",
+    "${workspaceFolder}/tools",
+    "${workspaceFolder}/tests"
+  ],
+  "C_Cpp.default.cStandard": "gnu11",
+  "C_Cpp.formatting": "clangFormat",
+  "C_Cpp.clang_format_style": "file",
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true,
+    "editor.rulers": [120]
+  },
+  "files.associations": { "*.h": "c" }
+}

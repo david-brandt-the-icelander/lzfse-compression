@@ -8,8 +8,10 @@ LZFSE (Apple's compression format) implemented from scratch in C (C11), aiming t
 - Every function, struct, enum and macro gets one short comment; public API comments live in `include/lzfse_zazzcat.h`.
 - Public names start with `lzfse_zazzcat_` (macros `LZFSE_ZAZZCAT_`); internal names are plain and live in `src/` headers.
 - Decoding handles untrusted input: return a status, never crash, never read or write out of bounds. Wide copies check their room once per token (`decode_token_fast`); anything rare goes to a cold, exact path. The sanitizer build (`make test-sanitize`) and the fuzz targets must stay clean.
-- The library allocates only through `zz_malloc`/`zz_calloc`/`zz_realloc` (see `src/common.h`), so the allocation tests can count it; reused encoders and decoders must not allocate.
+- The library allocates only through `zz_malloc`/`zz_calloc`/`zz_realloc` (see `src/memory_allocation.h`), so the allocation tests can count it; reused encoders and decoders must not allocate.
 - A speed change lands only with a measurement showing the gain (the benchmark, or callgrind instruction counts for small changes) and with the round-trip and compatibility tests passing.
+- Never call `memcpy`, `memmove`, `memset`, `memcmp`, `malloc`, `calloc`, `realloc` or `free` directly, anywhere (library, tests, tools, benchmark, fuzz). Use `copy_bytes`, `move_bytes`, `fill_bytes`, `clear_bytes` (zero-fill), `compare_bytes` and `raw_malloc`/`raw_calloc`/`raw_realloc`/`raw_free` from `src/memory_operations.h` (byte functions) and `src/memory_allocation.h` (allocation), the only files that include the C library versions; library code uses `zz_*` for allocation. A new memory function gets a wrapper in one of them first.
+- Never ignore a return value or out value, and never write `(void)call()`. Call the `bare_` version from `src/bare_functions.h` (named `bare_` + the real function's name, same arguments, returns nothing), which discards the result in one place. A function defined outside `src/` (a test or tool helper) gets its `bare_` version defined right beside it. A new function whose result callers drop gets a `bare_` wrapper first.
 - Never commit `build/`, corpora or benchmark inputs.
 
 ## Commands
