@@ -108,25 +108,26 @@ ALWAYS_INLINE bool decode_token_fast(uint8_t *restrict output, size_t output_cap
     // The checks above keep every step in bounds: literal steps read at most 15 bytes past the literals and
     // write at most 15 past `match_start`; match steps write at most 15 past the match. Each match step copies at
     // most `distance` bytes, so it only reads bytes already written.
-    const uint8_t *literal_source = literals + literal_position;
-    uint8_t *out = output + position;
-    copy16(out, literal_source);
-    for (size_t done = 16; done < literal_length; done += 16) copy16(out + done, literal_source + done);
-    out += literal_length;
-    const uint8_t *match_source = out - distance;
+    // From here on `literals` and `output` point at this token's literals and at where its output goes.
+    literals += literal_position;
+    output += position;
+    copy16(output, literals);
+    for (size_t done = 16; done < literal_length; done += 16) copy16(output + done, literals + done);
+    output += literal_length;
+    const uint8_t *match_source = output - distance;
     if (distance >= 16) {
-        copy16(out, match_source);
-        for (size_t done = 16; done < match_length; done += 16) copy16(out + done, match_source + done);
+        copy16(output, match_source);
+        for (size_t done = 16; done < match_length; done += 16) copy16(output + done, match_source + done);
     } else if (distance >= 8) {
-        copy8(out, match_source);
-        for (size_t done = 8; done < match_length; done += 8) copy8(out + done, match_source + done);
+        copy8(output, match_source);
+        for (size_t done = 8; done < match_length; done += 8) copy8(output + done, match_source + done);
     } else {
         // A short period: write the first 8 bytes one at a time (the pattern repeats every `distance` bytes),
         // then copy 8 bytes per step from `period_copy` back, the smallest multiple of `distance` that is at
         // least 8, so each step's source is already written and does not overlap its destination.
-        for (size_t i = 0; i < 8; i++) out[i] = match_source[i];
+        for (size_t i = 0; i < 8; i++) output[i] = match_source[i];
         size_t period_copy = distance * div_ceil(8, distance);
-        for (size_t done = 8; done < match_length; done += 8) copy8(out + done, out + done - period_copy);
+        for (size_t done = 8; done < match_length; done += 8) copy8(output + done, output + done - period_copy);
     }
     return true;
 }
