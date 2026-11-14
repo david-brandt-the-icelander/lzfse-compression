@@ -15,7 +15,10 @@
 #include "fse.h"
 #include "lzfse_zazzcat.h"
 
-#ifndef LZFSE_ZAZZCAT_NO_THREADS
+// The pthread wrappers are left out of a library built without threads, unless the including program starts
+// threads itself (the benchmark does) and defines LZFSE_ZAZZCAT_PROGRAM_USES_THREADS first.
+#if !defined(LZFSE_ZAZZCAT_NO_THREADS) || defined(LZFSE_ZAZZCAT_PROGRAM_USES_THREADS)
+#define LZFSE_ZAZZCAT_HAS_PTHREAD_WRAPPERS
 #include <pthread.h>
 #endif
 #include <dirent.h>
@@ -170,7 +173,7 @@ static inline void bare_fprintf(FILE *stream, const char *format, ...) {
     va_end(arguments);
 }
 
-#ifndef LZFSE_ZAZZCAT_NO_THREADS
+#ifdef LZFSE_ZAZZCAT_HAS_PTHREAD_WRAPPERS
 static inline void bare_pthread_create(pthread_t *thread, const pthread_attr_t *attributes, void *(*start)(void *),
                                        void *argument) {
     (void)pthread_create(thread, attributes, start, argument);
