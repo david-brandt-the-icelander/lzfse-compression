@@ -130,8 +130,7 @@ static void emit_literals(lzfse_zazzcat_buffer *out, const uint8_t *literals, si
     while (count > 0) {
         size_t n = min_size(count, 271);
         if (n >= 16) {
-            buffer_push_reserved(out, 0xE0);
-            buffer_push_reserved(out, (uint8_t)(n - 16));
+            buffer_push_2_reserved(out, 0xE0, (uint8_t)(n - 16));
         } else {
             buffer_push_reserved(out, (uint8_t)(0xE0 | n));
         }
@@ -146,8 +145,7 @@ static void emit_repeat(lzfse_zazzcat_buffer *out, size_t length) {
     while (length > 0) {
         size_t n = min_size(length, 271);
         if (n >= 16) {
-            buffer_push_reserved(out, 0xF0);
-            buffer_push_reserved(out, (uint8_t)(n - 16));
+            buffer_push_2_reserved(out, 0xF0, (uint8_t)(n - 16));
         } else {
             buffer_push_reserved(out, (uint8_t)(0xF0 | n));
         }
@@ -176,18 +174,15 @@ static void emit_token(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_
     } else if (distance < 16384 && (length > max_short_match(l) || distance >= 1536)) {
         first = min_size(length, 34);
         size_t word = (distance << 2) | ((first - 3) & 3);
-        buffer_push_reserved(out, (uint8_t)(0xA0 | (l << 3) | ((first - 3) >> 2)));
-        buffer_push_reserved(out, (uint8_t)word);
-        buffer_push_reserved(out, (uint8_t)(word >> 8));
+        buffer_push_3_reserved(out, (uint8_t)(0xA0 | (l << 3) | ((first - 3) >> 2)), (uint8_t)word,
+                               (uint8_t)(word >> 8));
     } else if (distance < 1536) {
         first = min_size(length, max_short_match(l));
-        buffer_push_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | (distance >> 8)));
-        buffer_push_reserved(out, (uint8_t)distance);
+        buffer_push_2_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | (distance >> 8)), (uint8_t)distance);
     } else {
         first = min_size(length, max_short_match(l));
-        buffer_push_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | 7));
-        buffer_push_reserved(out, (uint8_t)distance);
-        buffer_push_reserved(out, (uint8_t)(distance >> 8));
+        buffer_push_3_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | 7), (uint8_t)distance,
+                               (uint8_t)(distance >> 8));
     }
     if (inline_count > 0) buffer_append_reserved(out, literals, inline_count);
     emit_repeat(out, length - first);
