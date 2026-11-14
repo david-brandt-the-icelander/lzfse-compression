@@ -1,5 +1,4 @@
-/target
-/fuzz/target
-/fuzz/corpus
-/fuzz/artifacts
+# Build output (library, tools, tests, fuzz binaries and their corpora).
+/build
+# Local benchmark inputs.
 /corpus

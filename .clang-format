@@ -1,0 +1,8 @@
+# Formatting for the C sources (checked in CI with `make format-check`; apply with clang-format -i).
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AlignConsecutiveMacros: true
