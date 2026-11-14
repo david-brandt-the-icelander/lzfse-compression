@@ -1,6 +1,8 @@
 // Benchmark harness: compares lzfse-zazzcat with Apple's libcompression in-process and prints a Markdown report.
 //
-// Usage: lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [FILE]...
+// Usage: lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [--stats] [FILE]...
+// With --stats it prints, instead of timings, what each encoder chose: token counts and distributions read from
+// the compressed streams. The output holds only aggregate numbers, never the input's content.
 // Every encoded output is decoded back (and on macOS also by Apple's decoder) before its timing counts.
 use std::time::Instant;
 use std::{env, fs, thread};
@@ -394,18 +396,98 @@ fn report(rows: &[Row], threads: usize) {
     }
 }
 
+// Print one encoder's stream statistics for one input and shape as a Markdown block.
+fn print_stats(input: &str, shape: &str, who: &str, s: &lzfse::stats::StreamStats) {
+    let pct = |v: u64, of: u64| 100.0 * v as f64 / of.max(1) as f64;
+    let matches = s.tokens - s.literal_only;
+    println!("### {input}, {shape}: {who}\n");
+    println!(
+        "- stored {} of {} bytes (ratio {:.4}); blocks lzfse/lzvn/raw {:?}",
+        s.stored,
+        s.raw,
+        s.stored as f64 / s.raw.max(1) as f64,
+        s.blocks
+    );
+    println!(
+        "- bytes: headers {}, literals {}, match stream {}, other blocks {}",
+        s.header_bytes, s.literal_bytes, s.lmd_bytes, s.other_bytes
+    );
+    println!(
+        "- literals {} ({:.2} bits each); tokens {} ({:.2} bits each); literal-only tokens {}; repeat distances {} ({:.1}% of matches)",
+        s.literals,
+        8.0 * s.literal_bytes as f64 / s.literals.max(1) as f64,
+        s.tokens,
+        8.0 * s.lmd_bytes as f64 / s.tokens.max(1) as f64,
+        s.literal_only,
+        s.repeats,
+        pct(s.repeats, matches)
+    );
+    let row = |label: &str, bounds: &[u32], v: &[(u64, u64)]| {
+        let mut lo = 0u32;
+        let cells: Vec<String> = bounds
+            .iter()
+            .zip(v)
+            .map(|(&b, &(n, bytes))| {
+                let name = if b == u32::MAX {
+                    format!("{lo}+")
+                } else {
+                    format!("{lo}-{}", b - 1)
+                };
+                lo = b;
+                format!("{name}: {n} ({:.1}% of bytes)", pct(bytes, s.raw))
+            })
+            .collect();
+        println!("- {label}: {}", cells.join(", "));
+    };
+    row("match lengths", &lzfse::stats::LEN_BUCKETS, &s.by_len);
+    row("distances", &lzfse::stats::DIST_BUCKETS, &s.by_dist);
+    println!();
+}
+
+// For every input and shape, encode with each encoder and print what it chose.
+fn stats_mode(inputs: &[Input], chunks: &[usize]) {
+    for input in inputs {
+        for &chunk in chunks {
+            let chunk = chunk.min(input.data.len().max(1));
+            let s = shape(chunk, input.data.len());
+            let mut ours = lzfse::stats::StreamStats::default();
+            let mut enc = lzfse::Encoder::new(lzfse::Options::default());
+            let mut out = Vec::new();
+            for piece in input.data.chunks(chunk) {
+                out.clear();
+                enc.encode(piece, &mut out);
+                ours.add(&out).expect("our stream parses");
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let mut theirs = lzfse::stats::StreamStats::default();
+                let mut codec = apple::Codec::new();
+                for piece in input.data.chunks(chunk) {
+                    theirs
+                        .add(&codec.encode(piece))
+                        .expect("Apple's stream parses");
+                }
+                print_stats(&input.name, &s, "apple libcompression", &theirs);
+            }
+            print_stats(&input.name, &s, "lzfse-zazzcat", &ours);
+        }
+    }
+}
+
 // Parse arguments, load inputs and run every contender on every shape.
 fn main() {
     let mut args = env::args().skip(1);
     let (mut runs, mut chunks, mut inputs, mut use_synth) = (7usize, Vec::new(), Vec::new(), false);
+    let mut stats = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--runs" => runs = args.next().and_then(|v| v.parse().ok()).unwrap_or(runs),
             "--chunk" => chunks.extend(args.next().and_then(|v| v.parse::<usize>().ok())),
             "--synthetic" => use_synth = true,
+            "--stats" => stats = true,
             "-h" | "--help" => {
                 println!(
-                    "usage: lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [FILE]..."
+                    "usage: lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [--stats] [FILE]..."
                 );
                 return;
             }
@@ -420,6 +502,10 @@ fn main() {
     }
     if chunks.is_empty() {
         chunks = vec![65_536, 1 << 20, usize::MAX];
+    }
+    if stats {
+        stats_mode(&inputs, &chunks);
+        return;
     }
     let threads = lzfse::parallelism().max(1);
     let mut rows = Vec::new();
