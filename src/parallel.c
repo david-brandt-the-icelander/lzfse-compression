@@ -24,16 +24,20 @@ static lzfse_zazzcat_status encode_task(lzfse_zazzcat_encoder *encoder, const ui
                                         lzfse_zazzcat_buffer *buffer, size_t *ends) {
     size_t start = first_chunk * chunk_size;
     size_t task_length = min_size(chunk_count * chunk_size, length - start);
-    buffer->length = 0;
-    if (!buffer_reserve(buffer, task_bound(task_length, chunk_count))) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-    for (size_t c = 0; c < chunk_count; c++) {
+    // Work on a copy of the buffer's fields on this thread's stack. The encoder updates the length every few
+    // bytes; in the shared array, neighbouring tasks' buffers share a cache line, and those stores from different
+    // cores would keep taking the line from each other ("false sharing").
+    lzfse_zazzcat_buffer local = *buffer;
+    local.length = 0;
+    lzfse_zazzcat_status status = LZFSE_ZAZZCAT_OK;
+    if (!buffer_reserve(&local, task_bound(task_length, chunk_count))) status = LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    for (size_t c = 0; c < chunk_count && status == LZFSE_ZAZZCAT_OK; c++) {
         size_t at = start + c * chunk_size;
-        lzfse_zazzcat_status status =
-            lzfse_zazzcat_encoder_encode(encoder, source + at, min_size(chunk_size, length - at), buffer);
-        if (status != LZFSE_ZAZZCAT_OK) return status;
-        ends[c] = buffer->length;
+        status = lzfse_zazzcat_encoder_encode(encoder, source + at, min_size(chunk_size, length - at), &local);
+        ends[c] = local.length;
     }
-    return LZFSE_ZAZZCAT_OK;
+    *buffer = local;
+    return status;
 }
 
 // Grow an offsets array to hold at least `capacity` entries.
