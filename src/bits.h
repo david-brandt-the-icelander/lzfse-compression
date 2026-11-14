@@ -74,15 +74,20 @@ ALWAYS_INLINE lzfse_zazzcat_status bit_reader_init(bit_reader *reader, const uin
 // Load whole bytes from before the current position so that at least 56 bits are available. Fails if the stream
 // would need bytes before its start. Reading 8 bytes at `start` stays in bounds: init consumed at least 7 bytes
 // and the position only moves backwards.
+//
+// The accumulator's valid (low) bits are always the bytes at `position` onwards, as a little-endian load of
+// `buffer + position` would give them. So after moving the position back, one load from the new position holds
+// the new bytes below the old valid bits, and replaces masking in the new bytes, shifting the old ones up and
+// merging them. The bits above the valid ones differ (they are bytes already read), but bit_reader_pull never
+// looks at them. The early return matters for this: just after init with 7 bytes, a load at the position would
+// read one byte past the end of the buffer.
 ALWAYS_INLINE lzfse_zazzcat_status bit_reader_refill(bit_reader *reader) {
     uint32_t bytes = (63 - reader->bit_count) / 8;
     if (bytes == 0) return LZFSE_ZAZZCAT_OK;
     if (UNLIKELY(reader->position < bytes)) return LZFSE_ZAZZCAT_CORRUPT;
-    size_t start = reader->position - bytes;
-    uint64_t incoming = load_u64(reader->buffer + start) & ((1ull << (8 * bytes)) - 1);
-    reader->accumulator = (reader->accumulator << (8 * bytes)) | incoming;
+    reader->position -= bytes;
+    reader->accumulator = load_u64(reader->buffer + reader->position);
     reader->bit_count += 8 * bytes;
-    reader->position = start;
     return LZFSE_ZAZZCAT_OK;
 }
 
