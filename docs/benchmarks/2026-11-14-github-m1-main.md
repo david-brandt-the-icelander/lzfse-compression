@@ -21,21 +21,37 @@
 
 ## 1. Against Apple, on Apple Silicon
 
-Our speed divided by Apple's in the same run; above 1 means faster. The parallel columns use 3 threads against
-Apple's one.
+Our speed divided by Apple's in the same run, single-threaded; above 1 means faster. Each contender decodes its own
+encoder's output.
 
-| Input | Ratio vs Apple's | Encode | Decode | Parallel encode | Parallel decode |
-|---|---|---:|---:|---:|---:|
-| Text | 8–10% smaller | **1.53–1.62** | **1.19–1.24** | 4.3–4.4 | 3.1–3.4 |
-| JSON + base64 | 0.3% larger at 64 KiB, else equal | 1.35–2.22 | 1.06–1.07 | 3.7–6.3 | 2.8–3.1 |
-| Binary | 2–3% smaller | 1.01–1.10 | 1.00–1.06 | 2.7–2.8 | 2.6–3.0 |
-| Noise | 1% smaller | 2.0–2.2 | 63–75 | 4.0–5.2 | 27–29 |
-| Zeros | equal | 39–158 | 0.96–1.40 | 64–167 | 1.0–2.3 |
+| Input | Size vs Apple's output | Encode | Decode |
+|---|---|---:|---:|
+| Text | 8–10% smaller | **1.53–1.62** | **1.19–1.24** |
+| JSON + base64 | 0.3% larger at 64 KiB, else equal | 1.35–2.22 | 1.06–1.07 |
+| Binary | 2–3% smaller | 1.01–1.10 | 1.00–1.06 |
 
-On this runner the C version encodes and decodes every input at least as fast as Apple's, single-threaded. The one
-row below 1 is zeros decoded as one 8 MiB stream (0.96), where both decoders mostly fill memory. Parallel rows scale
-close to the 3 available threads: parallel speed over our single-threaded speed is 2.5–2.9× for both encoding and
-decoding on text, JSON and binaries.
+On this runner the C version encodes and decodes text, JSON and binaries at least as fast as Apple's.
+
+**Parallel scaling.** With 3 threads, our parallel speed is 2.5–2.9× our own single-threaded speed for both encoding
+and decoding on text, JSON and binaries, close to the ideal 3×. (Dividing it by Apple's single-threaded speed instead
+gives 2.7–6.3× for encoding and 2.6–3.4× for decoding, but that mixes thread count with code speed, so it is not shown
+as a speed comparison.)
+
+**Noise and zeros: different work, not faster code.** On these two inputs the two libraries do not do the same job,
+so their speed ratio says more about a design choice than about how fast the code is. MB/s, single-threaded:
+
+| Input | Shape | Encode: ours / Apple's | Decode: ours / Apple's | What differs |
+|---|---|---:|---:|---|
+| Noise | 64 KiB chunks | 423 / 209 | 40721 / 645 | Our encoder stores incompressible blocks raw, so our decode is a memory copy. Apple's entropy-codes them (its output is 1% larger than the input) and its decoder really decodes. |
+| Noise | 1 MiB chunks | 463 / 217 | 47127 / 655 | as above |
+| Noise | whole | 485 / 217 | 49345 / 659 | as above |
+| Zeros | 64 KiB chunks | 8729 / 223 | 22733 / 16194 | Both write the same size. Our match finder compares 8 bytes per step and skips indexing inside long runs; Apple's encoder is slower on zeros than on text. Both decoders mostly fill memory. |
+| Zeros | 1 MiB chunks | 20510 / 207 | 44384 / 37958 | as above |
+| Zeros | whole | 20867 / 132 | 36472 / 38130 | as above |
+
+The noise decode numbers are real for files our encoder wrote: already-compressed media stored by us decode 63–75×
+faster than when stored by Apple's encoder. They do not mean our decoder is 63× faster at decoding the same stream.
+Zeros encoding really is 39–158× faster, but only on long runs.
 
 The owner's M1 Pro run of `2a2729f` measured binary decoding 1–5% behind Apple's; this runner measures it 0–6%
 ahead. The difference is within what separate machines and runs give, so the binary-decode question stays open until
@@ -130,9 +146,11 @@ target chip: use it for the C/Rust columns only.
 
 ## Summary
 
-- On Apple Silicon (CI's virtual M1), the current version is at least as fast as Apple's on every input and shape,
-  single-threaded, except zeros decoded as one stream (0.96). It is 8–10% smaller on text and 2–3% smaller on
-  binaries.
+- On Apple Silicon (CI's virtual M1), the current version encodes and decodes text, JSON and binaries at least as
+  fast as Apple's, single-threaded, and is 8–10% smaller on text and 2–3% smaller on binaries.
+- Noise and zeros show large ratios (63–75× noise decoding, 39–158× zeros encoding) that come from different work,
+  not faster code: we store noise raw, and runs are cheap for our match finder. Zeros decoded as one stream is the
+  one case below Apple (0.96).
 - Parallel encoding and decoding scale close to the available threads.
 - Against the Rust version, the C version is level or faster on parallel encoding and on zeros and noise;
   single-threaded differences on x86 are mostly noise. JSON + base64 decoding trails Rust's, by about 4% relative to
