@@ -141,8 +141,10 @@ static size_t max_short_match(size_t literal_count) {
     return limits[literal_count];
 }
 
-// Append literal-only opcodes for `count` bytes at `literals`.
-static void emit_literals(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_t count) {
+// Append literal-only opcodes for `count` bytes at `literals`, of which `readable` bytes may be read. When at least
+// 16 bytes beyond each piece may be read, the piece is copied with wild_copy, which can write up to 15 bytes past
+// it; the output's reservation (2 bytes per input byte plus 64) leaves room, and later output overwrites them.
+static void emit_literals(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_t count, size_t readable) {
     while (count > 0) {
         size_t n = min_size(count, 271);
         if (n >= 16) {
@@ -150,8 +152,14 @@ static void emit_literals(lzfse_zazzcat_buffer *out, const uint8_t *literals, si
         } else {
             buffer_push_reserved(out, (uint8_t)(0xE0 | n));
         }
-        buffer_append_reserved(out, literals, n);
+        if (n + 16 <= readable) {
+            wild_copy(out->data + out->length, literals, n);
+            out->length += n;
+        } else {
+            buffer_append_reserved(out, literals, n);
+        }
         literals += n;
+        readable -= n;
         count -= n;
     }
 }
@@ -171,11 +179,12 @@ static void emit_repeat(lzfse_zazzcat_buffer *out, size_t length) {
 
 // Append the opcodes for `literal_count` literals followed by a match of `length` (>= 3) bytes at `distance`
 // (<= 65535). Up to 3 literals ride along in the match opcode; more go in a literal opcode of their own.
+// `readable` is how many bytes may be read from `literals` (to the end of the input).
 static void emit_token(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_t literal_count, size_t length,
-                       size_t distance, size_t previous_distance) {
+                       size_t distance, size_t previous_distance, size_t readable) {
     size_t inline_count = literal_count;
     if (literal_count > 3) {
-        emit_literals(out, literals, literal_count);
+        emit_literals(out, literals, literal_count, readable);
         inline_count = 0;
     }
     if (distance == previous_distance && inline_count == 0) {
@@ -200,7 +209,13 @@ static void emit_token(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_
         buffer_push_3_reserved(out, (uint8_t)((l << 6) | ((first - 3) << 3) | 7), (uint8_t)distance,
                                (uint8_t)(distance >> 8));
     }
-    if (inline_count > 0) buffer_append_reserved(out, literals, inline_count);
+    if (inline_count > 0) {
+        // Copy 4 bytes, a constant size the compiler turns into one load and one store, and keep 1 to 3 of them.
+        // Reading 4 is safe: the match of at least 3 bytes follows the literals. The extra written bytes are
+        // overwritten by the next output (at least the 8-byte end-of-stream trailer follows).
+        store_u32(out->data + out->length, load_u32(literals));
+        out->length += inline_count;
+    }
     emit_repeat(out, length - first);
 }
 
@@ -262,7 +277,8 @@ lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzf
         size_t back = match_length_backward(source, i - best_distance, i, i - literal_start);
         size_t start = i - back;
         size_t length = best_length + back;
-        emit_token(out, source + literal_start, start - literal_start, length, best_distance, previous_distance);
+        emit_token(out, source + literal_start, start - literal_start, length, best_distance, previous_distance,
+                   n - literal_start);
         previous_distance = best_distance;
         size_t end = start + length;
         for (size_t j = i + 1; j + 4 <= n && j < end; j++)
@@ -270,7 +286,7 @@ lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzf
         i = end;
         literal_start = end;
     }
-    emit_literals(out, source + literal_start, n - literal_start);
+    emit_literals(out, source + literal_start, n - literal_start, n - literal_start);
     static const uint8_t trailer[8] = {END_OF_STREAM_OPCODE, 0, 0, 0, 0, 0, 0, 0};
     buffer_append_reserved(out, trailer, 8);
     return LZFSE_ZAZZCAT_OK;

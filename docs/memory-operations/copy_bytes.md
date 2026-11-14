@@ -7,7 +7,7 @@ Shared rules and decisions: [README](README.md).
 | Kind | Sites | Size |
 |---|---|---|
 | Unaligned integer access | `load_u*`/`store_u*` (`common.h`), `copy8`/`copy16` (`copy.h`) | constant 2–16 B, inlined |
-| Short exact copies | `bit_reader_init` (`bits.h`), decoder and LZVN literals (`decode.c` slow path, `lzvn.c`), encoder literals near the input end (`encode_internal.h`) | 0 to a few hundred B |
+| Short exact copies | `bit_reader_init` (`bits.h`), decoder and LZVN literals (`decode.c` slow path, `lzvn.c`), encoder literals near the input end (`encode_internal.h`, `lzvn.c`) | 0 to a few hundred B |
 | Large copies | `gather` in `parallel.c` (joining task outputs), `push_uncompressed` (`encode.c`), uncompressed blocks in `decode.c`, raw decmpfs chunks (`decmpfs.c`, ≤ 64 KiB) | KiB to MiB |
 
 ## Assessment
@@ -20,6 +20,10 @@ Shared rules and decisions: [README](README.md).
   A hand-written NEON loop is unlikely to beat it. The noise rows in
   [the M1 Pro benchmark](../benchmarks/2026-11-14-owner-m1-pro-c.md) already decode uncompressed blocks at about
   34 GB/s, which is a single `copy_bytes`.
+
+The LZVN encoder (`lzvn.c`, inputs under 4 KiB) used to copy every token's literals with a variable size, a libc
+call per token. It now copies 1–3 literals as one constant 4-byte load and store, and longer runs with `wild_copy`
+away from the input's end; see [the blog post](../../blogs/2026-11-14-constant-size-lzvn-literals.md).
 
 ## Steps
 
