@@ -20,4 +20,5 @@ LZFSE (Apple's compression format) implemented from scratch in C (C11), aiming t
 - No-threads build: `make DEFINES=-DLZFSE_ZAZZCAT_NO_THREADS`.
 - CLI: `build/lzfse-zazzcat encode|decode <in> <out>`, `build/lzfse-zazzcat inspect <in>`.
 - Benchmarks: `build/lzfse-bench --help` (compares against `libcompression` on macOS; `--stats` compares the encoders' choices). Tune with `make CPU_FLAGS=-mcpu=apple-m1`.
+- Small files and allocators: the benchmark ends with a many-small-files table (one-shot calls against reused encoders and decoders; `--small-files` runs only that). To try another allocator, build a second copy that links it, e.g. `make BUILD=build/mimalloc LDFLAGS=-lmimalloc build/mimalloc/lzfse-bench` (on macOS add `-L$(brew --prefix mimalloc)/lib`); the report's Allocator line says whether it replaced malloc.
 - Fuzzing (clang with libFuzzer): `make fuzz FUZZ_SECONDS=60`.
