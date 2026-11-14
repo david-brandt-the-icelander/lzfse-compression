@@ -87,6 +87,21 @@ static lzfse_zazzcat_status decode_run(const uint8_t *source, size_t source_leng
         // Every opcode but end-of-stream needs at least one more byte after its literals.
         if (available <= o.opcode_length + o.literal_length) return LZFSE_ZAZZCAT_TRUNCATED;
         at += o.opcode_length;
+        // Fast path: the shared wide-copy token routine, which makes no calls. The literals sit in the stream
+        // right after the opcode. A literal-only opcode passes match length 0 and distance 1, which always passes
+        // its distance check because it carries at least one literal. Anything near either buffer's end, or
+        // invalid, falls through to the exact copies below.
+        size_t fast_match_length = o.distance == NO_MATCH ? 0 : o.match_length;
+        size_t fast_distance = o.distance == NO_MATCH         ? 1
+                               : o.distance == REUSE_DISTANCE ? previous_distance
+                                                              : o.distance;
+        if (decode_token_fast(output, output_capacity, position, source, source_length, at, o.literal_length,
+                              fast_distance, fast_match_length)) {
+            at += o.literal_length;
+            position += o.literal_length + fast_match_length;
+            if (o.distance != NO_MATCH) previous_distance = fast_distance;
+            continue;
+        }
         if (o.literal_length > 0) {
             if (o.literal_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
             copy_bytes(output + position, source + at, o.literal_length);
