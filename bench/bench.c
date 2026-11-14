@@ -1,14 +1,20 @@
 // Benchmark harness: compares lzfse-zazzcat with Apple's libcompression in one process and prints a Markdown
 // report.
 //
-//   lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [--stats] [FILE]...
+//   lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [--stats] [--small-files] [FILE]...
 //
 // Every encoded output is decoded back (and on macOS also by Apple's decoder) before its timing counts. With
 // --stats it prints, instead of timings, what each encoder chose: token counts and distributions read from the
 // compressed streams. That output holds only aggregate numbers, never the input's content.
+//
+// After the per-input table it times many small files (512 bytes to 256 KiB, cut from the synthetic text, JSON and
+// binary inputs): reused encoders and decoders against the one-shot calls that set up their own state every time.
+// --small-files runs only that part. The report names the allocator in use, so the benchmark can be rerun with
+// another one (for example mimalloc, linked or preloaded) and compared.
 #define _DARWIN_C_SOURCE
 // The benchmark starts its own decoding threads, also when the library is built without threads.
 #define LZFSE_ZAZZCAT_PROGRAM_USES_THREADS
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -388,25 +394,313 @@ static void print_command_line(const char *label, const char *command) {
 }
 #endif
 
-// Print the machine description and the results as Markdown.
-static void report(const row *rows, size_t count, size_t threads) {
-    struct utsname system;
-    bare_uname(&system);
-    bare_printf("## Environment\n\n");
-    bare_printf("- OS: %s %s\n", system.sysname, system.machine);
-#ifdef __APPLE__
-    print_command_line("Chip", "sysctl -n machdep.cpu.brand_string");
-    print_command_line("macOS", "sw_vers -productVersion");
-#endif
-    bare_printf("- Threads for the parallel rows: %zu\n", threads);
-    bare_printf("- Throughput is MB/s (10^6 bytes) of uncompressed data: the median of the timed runs, with the "
-                "contenders interleaved run by run.\n\n");
+// Print the per-input results as a Markdown table.
+static void report(const row *rows, size_t count) {
     bare_printf("| Input | Shape | Contender | Ratio | Encode MB/s | Decode MB/s |\n");
     bare_printf("|---|---|---|---:|---:|---:|\n");
     for (size_t i = 0; i < count; i++) {
         bare_printf("| %s | %s | %s | %.3f | %.0f | %.0f |\n", rows[i].input, rows[i].shape, rows[i].contender,
                     rows[i].ratio, rows[i].encode_mbs, rows[i].decode_mbs);
     }
+}
+
+// --- Allocator ---
+
+// Describe the allocator behind malloc. mimalloc is recognised by its own functions, found in the running process,
+// and counts as the process allocator only if a fresh malloc block lies in its heap.
+static void describe_allocator(char *out, size_t size) {
+    snprintf(out, size, "the system's malloc");
+    void *process = dlopen(NULL, RTLD_LAZY);
+    if (process == NULL) return;
+    int (*mimalloc_version)(void) = (int (*)(void))dlsym(process, "mi_version");
+    bool (*in_mimalloc_heap)(const void *) = (bool (*)(const void *))dlsym(process, "mi_is_in_heap_region");
+    if (mimalloc_version != NULL && in_mimalloc_heap != NULL) {
+        // mi_version() packs the version into one number: 212 for 2.1.2 in mimalloc 2, and two digits each for the
+        // minor and patch numbers in newer releases (30601 for 3.6.1).
+        int version = mimalloc_version();
+        int major = version >= 10000 ? version / 10000 : version / 100;
+        int minor = version >= 10000 ? version / 100 % 100 : version / 10 % 10;
+        int patch = version >= 10000 ? version % 100 : version % 10;
+        void *probe = raw_malloc(64);
+        bool replaces_malloc = in_mimalloc_heap(probe);
+        raw_free(probe);
+        snprintf(out, size, "mimalloc %d.%d.%d (mi_version %d; %s)", major, minor, patch, version,
+                 replaces_malloc ? "replaces malloc for the whole process"
+                                 : "loaded, but malloc is still the system's");
+    }
+    dlclose(process);
+}
+
+// Print the machine description as Markdown.
+static void print_environment(size_t threads) {
+    struct utsname system;
+    bare_uname(&system);
+    char allocator[128];
+    describe_allocator(allocator, sizeof allocator);
+    bare_printf("## Environment\n\n");
+    bare_printf("- OS: %s %s\n", system.sysname, system.machine);
+#ifdef __APPLE__
+    print_command_line("Chip", "sysctl -n machdep.cpu.brand_string");
+    print_command_line("macOS", "sw_vers -productVersion");
+#endif
+    bare_printf("- Allocator: %s\n", allocator);
+    bare_printf("- Threads for the parallel rows: %zu\n", threads);
+    bare_printf("- Throughput is MB/s (10^6 bytes) of uncompressed data: the median of the timed runs, with the "
+                "contenders interleaved run by run.\n\n");
+}
+
+// --- Many small files ---
+
+// One small file: a slice of a synthetic input.
+typedef struct small_file {
+    const uint8_t *data;
+    size_t length;
+} small_file;
+
+// How a small-files contender sets up its state.
+typedef enum small_kind { SMALL_OURS_REUSED, SMALL_OURS_ONE_SHOT, SMALL_APPLE_REUSED, SMALL_APPLE_ONE_SHOT } small_kind;
+
+// One small-files contender: its streams (one per file) and the state it reuses between files.
+typedef struct small_contender {
+    const char *name;
+    small_kind kind;
+    lzfse_zazzcat_buffer *streams;
+    size_t packed_bytes;
+    lzfse_zazzcat_encoder *encoder;
+    lzfse_zazzcat_decoder *decoder;
+    void *apple_encode_scratch;
+    void *apple_decode_scratch;
+    // The output buffer, reused by every contender: only the library's own per-call setup differs.
+    lzfse_zazzcat_buffer encoded;
+    uint8_t *decoded;
+    size_t decoded_capacity;
+} small_contender;
+
+// Cut the text, JSON and binary inputs into files. Sizes are spread evenly on a log scale from 512 bytes to
+// 256 KiB: a power of two from 2^9 to 2^17, then a uniform size up to twice that. Returns how many files.
+static size_t cut_small_files(const input *inputs, size_t input_count, small_file **files_out, size_t *largest) {
+    size_t capacity = 0, count = 0;
+    for (size_t i = 0; i < input_count; i++) capacity += inputs[i].data.length / 512 + 1;
+    small_file *files = raw_calloc(capacity, sizeof *files);
+    *largest = 0;
+    for (size_t i = 0; i < input_count; i++) {
+        if (strcmp(inputs[i].name, "text") != 0 && strcmp(inputs[i].name, "jsonl+base64") != 0 &&
+            strcmp(inputs[i].name, "binary") != 0) {
+            continue;
+        }
+        size_t at = 0;
+        while (at < inputs[i].data.length && count < capacity) {
+            uint32_t r = next_random();
+            size_t octave = (size_t)512 << (r % 9);
+            size_t length = octave + (r >> 8) % octave;
+            if (length > inputs[i].data.length - at) length = inputs[i].data.length - at;
+            files[count++] = (small_file){inputs[i].data.data + at, length};
+            if (length > *largest) *largest = length;
+            at += length;
+        }
+    }
+    *files_out = files;
+    return count;
+}
+
+// Encode file `f` into `out` (replacing its contents) the contender's way.
+static void small_encode(small_contender *c, const small_file *f, lzfse_zazzcat_buffer *out) {
+    out->length = 0;
+    switch (c->kind) {
+    case SMALL_OURS_REUSED:
+        bare_lzfse_zazzcat_encoder_encode(c->encoder, f->data, f->length, out);
+        return;
+    case SMALL_OURS_ONE_SHOT:
+        bare_lzfse_zazzcat_encode(f->data, f->length, NULL, out);
+        return;
+    case SMALL_APPLE_REUSED:
+    case SMALL_APPLE_ONE_SHOT:
+#ifdef __APPLE__
+    {
+        size_t capacity = f->length + f->length / 2 + 1024;
+        if (out->capacity < capacity) {
+            out->data = raw_realloc(out->data, capacity);
+            out->capacity = capacity;
+        }
+        void *scratch = c->kind == SMALL_APPLE_REUSED ? c->apple_encode_scratch : NULL;
+        out->length = compression_encode_buffer(out->data, capacity, f->data, f->length, scratch, COMPRESSION_LZFSE);
+    }
+#endif
+        return;
+    }
+}
+
+// Decode stream `s` into the contender's decode buffer the contender's way; returns the decoded length.
+static size_t small_decode(small_contender *c, const lzfse_zazzcat_buffer *s) {
+    size_t written = 0;
+    switch (c->kind) {
+    case SMALL_OURS_REUSED:
+        bare_lzfse_zazzcat_decoder_decode(c->decoder, s->data, s->length, c->decoded, c->decoded_capacity, &written);
+        break;
+    case SMALL_OURS_ONE_SHOT:
+        bare_lzfse_zazzcat_decode_into(s->data, s->length, c->decoded, c->decoded_capacity, &written);
+        break;
+    case SMALL_APPLE_REUSED:
+    case SMALL_APPLE_ONE_SHOT:
+#ifdef __APPLE__
+        written = compression_decode_buffer(c->decoded, c->decoded_capacity, s->data, s->length,
+                                            c->kind == SMALL_APPLE_REUSED ? c->apple_decode_scratch : NULL,
+                                            COMPRESSION_LZFSE);
+#endif
+        break;
+    }
+    return written;
+}
+
+// small_decode for callers that ignore the length (see src/bare_functions.h).
+static void bare_small_decode(small_contender *c, const lzfse_zazzcat_buffer *s) {
+    (void)small_decode(c, s);
+}
+
+// Prepare a contender: encode every file once and check that each stream decodes back with its own decoder and
+// with ours.
+static void small_init(small_contender *c, const char *name, small_kind kind, const small_file *files, size_t count,
+                       size_t largest) {
+    clear_bytes(c, sizeof *c);
+    c->name = name;
+    c->kind = kind;
+    c->streams = raw_calloc(count, sizeof *c->streams);
+    c->encoder = lzfse_zazzcat_encoder_create(NULL);
+    c->decoder = lzfse_zazzcat_decoder_create();
+    c->decoded_capacity = largest + 64;
+    c->decoded = raw_malloc(c->decoded_capacity);
+#ifdef __APPLE__
+    c->apple_encode_scratch = raw_malloc(compression_encode_scratch_buffer_size(COMPRESSION_LZFSE) + 1);
+    c->apple_decode_scratch = raw_malloc(compression_decode_scratch_buffer_size(COMPRESSION_LZFSE) + 1);
+#endif
+    for (size_t i = 0; i < count; i++) {
+        small_encode(c, &files[i], &c->streams[i]);
+        c->packed_bytes += c->streams[i].length;
+        bool ok = small_decode(c, &c->streams[i]) == files[i].length &&
+                  equal_bytes(c->decoded, files[i].data, files[i].length);
+        size_t written = 0;
+        ok = ok &&
+             lzfse_zazzcat_decode_into(c->streams[i].data, c->streams[i].length, c->decoded, c->decoded_capacity,
+                                       &written) == LZFSE_ZAZZCAT_OK &&
+             written == files[i].length && equal_bytes(c->decoded, files[i].data, files[i].length);
+        if (!ok) {
+            bare_fprintf(stderr, "small files: %s failed on file %zu\n", name, i);
+            exit(1);
+        }
+    }
+}
+
+// Release a small-files contender's state.
+static void small_free(small_contender *c, size_t count) {
+    for (size_t i = 0; i < count; i++) lzfse_zazzcat_buffer_free(&c->streams[i]);
+    raw_free(c->streams);
+    lzfse_zazzcat_encoder_destroy(c->encoder);
+    lzfse_zazzcat_decoder_destroy(c->decoder);
+    raw_free(c->apple_encode_scratch);
+    raw_free(c->apple_decode_scratch);
+    lzfse_zazzcat_buffer_free(&c->encoded);
+    raw_free(c->decoded);
+}
+
+// File-size classes for the small-files report, by upper bound.
+#define SMALL_CLASSES 3
+static const size_t small_class_limits[SMALL_CLASSES] = {4096, 32768, SIZE_MAX};
+static const char *const small_class_names[SMALL_CLASSES] = {"512 B to 4 KiB", "4 to 32 KiB", "32 to 256 KiB"};
+
+// Size class of a file.
+static size_t small_class(size_t length) {
+    size_t k = 0;
+    while (length > small_class_limits[k]) k++;
+    return k;
+}
+
+// Time every small-files contender (interleaved run by run, like the main table) on each size class and print the
+// results: one table for all files and one per class in files per second.
+static void small_files_mode(const input *inputs, size_t input_count, size_t runs) {
+    small_file *files;
+    size_t largest, count = cut_small_files(inputs, input_count, &files, &largest);
+    if (count == 0) {
+        raw_free(files);
+        return;
+    }
+    size_t total = 0, class_files[SMALL_CLASSES] = {0};
+    for (size_t i = 0; i < count; i++) {
+        total += files[i].length;
+        class_files[small_class(files[i].length)]++;
+    }
+    small_contender contenders[4];
+    size_t n = 0;
+#ifdef __APPLE__
+    small_init(&contenders[n++], "apple libcompression, scratch reused", SMALL_APPLE_REUSED, files, count, largest);
+    small_init(&contenders[n++], "apple libcompression, one-shot", SMALL_APPLE_ONE_SHOT, files, count, largest);
+#endif
+    small_init(&contenders[n++], "lzfse-zazzcat, encoder/decoder reused", SMALL_OURS_REUSED, files, count, largest);
+    small_init(&contenders[n++], "lzfse-zazzcat, one-shot", SMALL_OURS_ONE_SHOT, files, count, largest);
+    // Times per contender, class (the last slot holds all files) and run.
+    size_t slots = SMALL_CLASSES + 1;
+    double *encode_times = raw_calloc(n * slots * runs, sizeof(double));
+    double *decode_times = raw_calloc(n * slots * runs, sizeof(double));
+    for (size_t run = 0; run <= runs; run++) {
+        for (size_t k = 0; k < n; k++) {
+            size_t c = (run + k) % n;
+            small_contender *current = &contenders[c];
+            for (size_t cls = 0; cls < SMALL_CLASSES; cls++) {
+                double start = now_seconds();
+                for (size_t i = 0; i < count; i++) {
+                    if (small_class(files[i].length) == cls) small_encode(current, &files[i], &current->encoded);
+                }
+                double encoded = now_seconds();
+                for (size_t i = 0; i < count; i++) {
+                    if (small_class(files[i].length) == cls) bare_small_decode(current, &current->streams[i]);
+                }
+                double decoded = now_seconds();
+                // Run 0 is an untimed warm-up.
+                if (run > 0) {
+                    encode_times[(c * slots + cls) * runs + run - 1] = encoded - start;
+                    decode_times[(c * slots + cls) * runs + run - 1] = decoded - encoded;
+                    encode_times[(c * slots + SMALL_CLASSES) * runs + run - 1] += encoded - start;
+                    decode_times[(c * slots + SMALL_CLASSES) * runs + run - 1] += decoded - encoded;
+                }
+            }
+        }
+    }
+    bare_printf("\n## Many small files\n\n");
+    bare_printf("- %zu files, %.1f MiB in all, 512 bytes to %zu KiB each (log-uniform sizes), cut from the text, JSON "
+                "and binary inputs.\n",
+                count, (double)total / (1 << 20), largest >> 10);
+    bare_printf("- One-shot: the library sets up its encoder or decoder state for every file (lzfse_zazzcat_encode "
+                "and lzfse_zazzcat_decode_into; Apple's calls with a NULL scratch buffer). Reused: one encoder, "
+                "decoder or scratch buffer for all files. Output buffers are reused in every row.\n\n");
+    bare_printf("| Contender | Ratio | Encode MB/s | Encode files/s | Decode MB/s | Decode files/s |\n");
+    bare_printf("|---|---:|---:|---:|---:|---:|\n");
+    for (size_t c = 0; c < n; c++) {
+        double encode_seconds = median(encode_times + (c * slots + SMALL_CLASSES) * runs, runs);
+        double decode_seconds = median(decode_times + (c * slots + SMALL_CLASSES) * runs, runs);
+        bare_printf("| %s | %.3f | %.0f | %.0f | %.0f | %.0f |\n", contenders[c].name,
+                    (double)contenders[c].packed_bytes / (double)total, (double)total / encode_seconds / 1e6,
+                    (double)count / encode_seconds, (double)total / decode_seconds / 1e6,
+                    (double)count / decode_seconds);
+    }
+    bare_printf("\nBy file size, in thousands of files per second (encode / decode):\n\n| Contender |");
+    for (size_t cls = 0; cls < SMALL_CLASSES; cls++)
+        bare_printf(" %s (%zu files) |", small_class_names[cls], class_files[cls]);
+    bare_printf("\n|---|");
+    for (size_t cls = 0; cls < SMALL_CLASSES; cls++) bare_printf("---:|");
+    bare_printf("\n");
+    for (size_t c = 0; c < n; c++) {
+        bare_printf("| %s |", contenders[c].name);
+        for (size_t cls = 0; cls < SMALL_CLASSES; cls++) {
+            double encode_seconds = median(encode_times + (c * slots + cls) * runs, runs);
+            double decode_seconds = median(decode_times + (c * slots + cls) * runs, runs);
+            bare_printf(" %.1f / %.1f |", (double)class_files[cls] / encode_seconds / 1e3,
+                        (double)class_files[cls] / decode_seconds / 1e3);
+        }
+        bare_printf("\n");
+    }
+    for (size_t c = 0; c < n; c++) small_free(&contenders[c], count);
+    raw_free(encode_times);
+    raw_free(decode_times);
+    raw_free(files);
 }
 
 // --- Stats mode ---
@@ -504,7 +798,7 @@ static void stats_mode(const input *inputs, size_t input_count, const size_t *ch
 // Parse arguments, load the inputs and run every contender on every shape.
 int main(int argc, char **argv) {
     size_t runs = 7, chunks[16], chunk_count = 0, input_count = 0;
-    bool use_synthetic = false, stats = false;
+    bool use_synthetic = false, stats = false, only_small_files = false;
     input *inputs = raw_calloc((size_t)argc + 5, sizeof *inputs);
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "--runs") == 0 && a + 1 < argc) {
@@ -516,8 +810,11 @@ int main(int argc, char **argv) {
             use_synthetic = true;
         } else if (strcmp(argv[a], "--stats") == 0) {
             stats = true;
+        } else if (strcmp(argv[a], "--small-files") == 0) {
+            only_small_files = true;
         } else if (strcmp(argv[a], "-h") == 0 || strcmp(argv[a], "--help") == 0) {
-            bare_printf("usage: lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [--stats] [FILE]...\n");
+            bare_printf("usage: lzfse-bench [--runs N] [--chunk BYTES]... [--synthetic] [--stats] [--small-files] "
+                        "[FILE]...\n");
             return 0;
         } else {
             input *in = &inputs[input_count++];
@@ -526,7 +823,8 @@ int main(int argc, char **argv) {
             if (read_file(argv[a], &in->data) != 0) return 1;
         }
     }
-    if (use_synthetic || input_count == 0) input_count += synthetic_inputs(inputs + input_count);
+    // The small-files part cuts its files from the synthetic inputs, so --small-files loads them too.
+    if (use_synthetic || input_count == 0 || only_small_files) input_count += synthetic_inputs(inputs + input_count);
     if (chunk_count == 0) {
         chunks[chunk_count++] = 65536;
         chunks[chunk_count++] = 1 << 20;
@@ -537,6 +835,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     size_t threads = lzfse_zazzcat_parallelism();
+    print_environment(threads);
+    if (only_small_files) {
+        small_files_mode(inputs, input_count, runs);
+        return 0;
+    }
     row *rows = raw_calloc(input_count * chunk_count * 3, sizeof *rows);
     size_t row_count = 0;
     for (size_t i = 0; i < input_count; i++) {
@@ -547,6 +850,7 @@ int main(int argc, char **argv) {
             bare_fprintf(stderr, "done: %s %s\n", inputs[i].name, rows[row_count - 1].shape);
         }
     }
-    report(rows, row_count, threads);
+    report(rows, row_count);
+    small_files_mode(inputs, input_count, runs);
     return 0;
 }
