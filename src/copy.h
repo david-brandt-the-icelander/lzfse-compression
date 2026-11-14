@@ -84,9 +84,13 @@ ALWAYS_INLINE void wild_copy(uint8_t *destination, const uint8_t *source, size_t
 // loop keeps its state in registers. Returns false, having written nothing, when the token needs the careful
 // path: too close to the end of either buffer, an invalid distance, or a run longer than 64 bytes with a period
 // shorter than 8.
-ALWAYS_INLINE bool decode_token_fast(uint8_t *output, size_t output_capacity, size_t position, const uint8_t *literals,
-                                     size_t literals_capacity, size_t literal_position, size_t literal_length,
-                                     size_t distance, size_t match_length) {
+//
+// `restrict` promises the compiler that the output and the literals do not overlap, so it need not reload one
+// after writing the other. `literals_capacity` is how far the literals may be read (16 past each token's literals).
+ALWAYS_INLINE bool decode_token_fast(uint8_t *restrict output, size_t output_capacity, size_t position,
+                                     const uint8_t *restrict literals, size_t literals_capacity,
+                                     size_t literal_position, size_t literal_length, size_t distance,
+                                     size_t match_length) {
     size_t match_start = position + literal_length;
     // `distance - 1 < match_start` checks 1 <= distance <= match_start in one comparison: for distance 0 the
     // unsigned subtraction wraps around to the largest value.

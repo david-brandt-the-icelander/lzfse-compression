@@ -80,4 +80,12 @@ ALWAYS_INLINE uint32_t fse_decode_value(uint32_t *state, const fse_value_entry *
     return entry.value_base + (bits & ((1u << entry.value_bits) - 1));
 }
 
+// Decode one value from an entry the caller already looked up, and store the next state in `*state`. Lets a loop
+// look up the next entry early (see decode_tokens).
+ALWAYS_INLINE uint32_t fse_decode_value_from(fse_value_entry entry, uint32_t *state, bit_reader *reader) {
+    uint32_t bits = bit_reader_pull(reader, entry.total_bits);
+    *state = entry.next_state_base + (bits >> entry.value_bits);
+    return entry.value_base + (bits & ((1u << entry.value_bits) - 1));
+}
+
 #endif

@@ -8,9 +8,9 @@
 // Decoding tables and the literal buffer, reused across blocks and calls.
 struct lzfse_zazzcat_decoder {
     fse_literal_entry literal_table[LITERAL_STATES];
-    fse_value_entry literal_length_table[LITERAL_LENGTH_STATES];
-    fse_value_entry match_length_table[MATCH_LENGTH_STATES];
-    fse_value_entry distance_table[DISTANCE_STATES];
+    // The three value tables, back to back, so the token loop can reach all of them from one pointer:
+    // literal lengths at [0, 64), match lengths at [64, 128), distances at [128, 384).
+    fse_value_entry value_tables[LITERAL_LENGTH_STATES + MATCH_LENGTH_STATES + DISTANCE_STATES];
     // A block's decoded literals; grows to the largest block seen (at most 40,000 literals plus slack).
     uint8_t *literals;
     size_t literals_capacity;
@@ -93,19 +93,24 @@ static NOINLINE lzfse_zazzcat_status decode_literals(lzfse_zazzcat_decoder *d, c
     uint8_t *out = d->literals;
     for (size_t i = 0; i < count; i += 4) {
         if ((status = bit_reader_refill(&reader))) return status;
-        out[i + 0] = fse_decode_literal(&state0, table, LITERAL_STATES - 1, &reader);
-        out[i + 1] = fse_decode_literal(&state1, table, LITERAL_STATES - 1, &reader);
-        out[i + 2] = fse_decode_literal(&state2, table, LITERAL_STATES - 1, &reader);
-        out[i + 3] = fse_decode_literal(&state3, table, LITERAL_STATES - 1, &reader);
+        // Gather the four literals in a register and store them with one write. Storing them byte by byte would
+        // force the compiler to keep each later table lookup behind the earlier stores (in C, a byte store may
+        // change any memory, including the table).
+        uint32_t four = fse_decode_literal(&state0, table, LITERAL_STATES - 1, &reader);
+        four |= (uint32_t)fse_decode_literal(&state1, table, LITERAL_STATES - 1, &reader) << 8;
+        four |= (uint32_t)fse_decode_literal(&state2, table, LITERAL_STATES - 1, &reader) << 16;
+        four |= (uint32_t)fse_decode_literal(&state3, table, LITERAL_STATES - 1, &reader) << 24;
+        store_u32(out + i, four);
     }
     return LZFSE_ZAZZCAT_OK;
 }
 
-// Execute a token the fast path declined: check its distance, then copy exactly. Kept out of line: it is rarely
-// taken, and keeping its calls out of the hot loop keeps the decoder's state in registers.
+// Execute a token the fast path declined: check its literal count and distance, then copy exactly. Kept out of
+// line: it is rarely taken, and keeping its calls out of the hot loop keeps the decoder's state in registers.
 static COLD lzfse_zazzcat_status decode_token_slow(uint8_t *output, size_t output_capacity, size_t position,
-                                                   const uint8_t *literals, size_t literal_length, size_t distance,
-                                                   size_t length) {
+                                                   const uint8_t *literals, size_t literals_available,
+                                                   size_t literal_length, size_t distance, size_t length) {
+    if (literal_length > literals_available) return LZFSE_ZAZZCAT_CORRUPT;
     size_t match_start = position + literal_length;
     if (distance == 0 || distance > match_start) return LZFSE_ZAZZCAT_CORRUPT;
     if (match_start > output_capacity || length > output_capacity - match_start) {
@@ -127,11 +132,12 @@ static NOINLINE lzfse_zazzcat_status decode_tokens(lzfse_zazzcat_decoder *d, con
                                                    uint8_t *output, size_t output_capacity, size_t *position_io) {
     lzfse_zazzcat_status status;
     if ((status = fse_value_table(h->literal_length_frequencies, LITERAL_LENGTH_SYMBOLS, LITERAL_LENGTH_STATES,
-                                  literal_length_extra_bits, literal_length_base, d->literal_length_table)) ||
-        (status = fse_value_table(h->match_length_frequencies, MATCH_LENGTH_SYMBOLS, MATCH_LENGTH_STATES,
-                                  match_length_extra_bits, match_length_base, d->match_length_table)) ||
+                                  literal_length_extra_bits, literal_length_base, d->value_tables)) ||
+        (status =
+             fse_value_table(h->match_length_frequencies, MATCH_LENGTH_SYMBOLS, MATCH_LENGTH_STATES,
+                             match_length_extra_bits, match_length_base, d->value_tables + LITERAL_LENGTH_STATES)) ||
         (status = fse_value_table(h->distance_frequencies, DISTANCE_SYMBOLS, DISTANCE_STATES, distance_extra_bits,
-                                  distance_base, d->distance_table))) {
+                                  distance_base, d->value_tables + LITERAL_LENGTH_STATES + MATCH_LENGTH_STATES))) {
         return status;
     }
     bit_reader reader = {0};
@@ -145,22 +151,36 @@ static NOINLINE lzfse_zazzcat_status decode_tokens(lzfse_zazzcat_decoder *d, con
     size_t position = *position_io;
     // 0 until a token sets it, so a block starting with "repeat the previous distance" is rejected.
     size_t previous_distance = 0;
+    // Locals rather than reads through `h` and `d`: in C, every byte stored into the output might change memory
+    // that pointers point to, so values read through pointers would be reloaded after each token.
     const uint8_t *literals = d->literals;
-    size_t literals_capacity = d->literals_capacity;
-    for (uint32_t t = 0; t < h->token_count; t++) {
+    const fse_value_entry *tables = d->value_tables;
+    // The fast path requires `literal_position + literal_length + 16 <= literal_limit`, which also checks that the
+    // token stays within this block's literals (the buffer has COPY_SLACK >= 16 spare bytes after them).
+    size_t literal_limit = literal_count + 16;
+    // Each token's table entries are looked up at the end of the previous token, before its copies: the states
+    // then stay in registers (otherwise the compiler postpones the state updates past the copies and spills
+    // their pieces), and the loads overlap the copies. Masking keeps every index in range.
+    const fse_value_entry *match_table = tables + LITERAL_LENGTH_STATES;
+    const fse_value_entry *distance_table = match_table + MATCH_LENGTH_STATES;
+    fse_value_entry literal_length_entry = tables[literal_length_state & (LITERAL_LENGTH_STATES - 1)];
+    fse_value_entry match_length_entry = match_table[match_length_state & (MATCH_LENGTH_STATES - 1)];
+    fse_value_entry distance_entry = distance_table[distance_state & (DISTANCE_STATES - 1)];
+    for (uint32_t tokens_left = h->token_count; tokens_left > 0; tokens_left--) {
         if ((status = bit_reader_refill(&reader))) return status;
-        size_t literal_length =
-            fse_decode_value(&literal_length_state, d->literal_length_table, LITERAL_LENGTH_STATES - 1, &reader);
-        size_t length = fse_decode_value(&match_length_state, d->match_length_table, MATCH_LENGTH_STATES - 1, &reader);
-        size_t coded_distance = fse_decode_value(&distance_state, d->distance_table, DISTANCE_STATES - 1, &reader);
+        size_t literal_length = fse_decode_value_from(literal_length_entry, &literal_length_state, &reader);
+        size_t length = fse_decode_value_from(match_length_entry, &match_length_state, &reader);
+        size_t coded_distance = fse_decode_value_from(distance_entry, &distance_state, &reader);
+        literal_length_entry = tables[literal_length_state & (LITERAL_LENGTH_STATES - 1)];
+        match_length_entry = match_table[match_length_state & (MATCH_LENGTH_STATES - 1)];
+        distance_entry = distance_table[distance_state & (DISTANCE_STATES - 1)];
         // A coded distance of 0 means "the same distance as the previous token".
         size_t distance = coded_distance != 0 ? coded_distance : previous_distance;
         previous_distance = distance;
-        if (literal_length > literal_count - literal_position) return LZFSE_ZAZZCAT_CORRUPT;
-        if (!decode_token_fast(output, output_capacity, position, literals, literals_capacity, literal_position,
+        if (!decode_token_fast(output, output_capacity, position, literals, literal_limit, literal_position,
                                literal_length, distance, length)) {
-            status = decode_token_slow(output, output_capacity, position, literals + literal_position, literal_length,
-                                       distance, length);
+            status = decode_token_slow(output, output_capacity, position, literals + literal_position,
+                                       literal_count - literal_position, literal_length, distance, length);
             if (status != LZFSE_ZAZZCAT_OK) return status;
         }
         literal_position += literal_length;
