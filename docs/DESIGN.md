@@ -4,7 +4,7 @@ Status: **approved** (owner decisions in section 9). Implementation follows the 
 
 ## 1. Goals
 
-1. **A complete LZFSE codec written from scratch in Rust.** It covers the encoder and decoder for every block type an LZFSE stream can contain, including LZVN (section 3).
+1. **A complete LZFSE codec written from scratch, in C (C11).** It was first written in Rust and converted to C on 2026-11-14 (section 9). The codec covers the encoder and decoder for every block type an LZFSE stream can contain, including LZVN (section 3).
 2. **Faster than Apple's.** The bar is measurable and defined in section 6:
    - **Single-threaded parity:** single-threaded encode and decode throughput at least matches `libcompression`'s LZFSE (`COMPRESSION_LZFSE`), with a compression ratio no more than 0.5% worse on the benchmark corpus.
    - **Multi-core:** a block-parallel API beats `libcompression` by roughly the number of performance cores. Apple's API is single-call and single-threaded.
@@ -13,13 +13,13 @@ Status: **approved** (owner decisions in section 9). Implementation follows the 
    - We decode everything Apple's encoder produces.
 
    Our output does not have to be byte-identical to Apple's.
-4. **Safe on untrusted input.** Malformed or hostile input makes the decoder return an error. It never panics, reads or writes out of bounds, loops forever or allocates without limit.
+4. **Safe on untrusted input.** Malformed or hostile input makes the decoder return an error. It never crashes, reads or writes out of bounds, loops forever or allocates without limit.
 5. **Usable by `free-disk-space`.** It must cover APFS transparent compression (decmpfs types 11/12), which macOS 26–27 no longer writes through `ditto --hfsCompression`.
 6. **A portfolio piece.** That means a readable design, measured claims and reproducible benchmarks.
 
 Non-goals for now:
 
-- Intel Macs: not supported. The portable Rust path still builds on x86-64 Linux for CI.
+- Intel Macs: not supported. The portable C code still builds on x86-64 Linux for CI.
 - GPU, Neural Engine and AMX/SME offload (section 5.5).
 - Other Apple formats (LZ4, LZBITMAP, Brotli).
 
@@ -134,7 +134,7 @@ LZVN is a byte-oriented LZ77 format with no entropy coding. Each opcode carries 
 
 ### 3.4 APFS transparent compression (decmpfs)
 
-Verified on Apple Silicon in CI (`tests/apple.rs`).
+Verified on Apple Silicon in CI (`tests/apple_tests.c`).
 
 - **Header:** the `com.apple.decmpfs` xattr starts with a 16-byte header: magic `fpmc`, a little-endian `u32`
   compression type and a `u64` uncompressed size.
@@ -152,36 +152,43 @@ Verified on Apple Silicon in CI (`tests/apple.rs`).
 
 ## 4. Architecture
 
-### 4.1 Workspace
+### 4.1 Layout
 
 ```
-crates/
-  lzfse/         library: format, FSE, LZVN, match finder, block and stream codecs
-  lzfse-cli/     encode / decode / inspect command line tool
-  lzfse-bench/   benchmark harness (section 6), with libcompression and reference FFI
-fuzz/            cargo-fuzz targets
-docs/            this design, benchmark reports
+include/lzfse_zazzcat.h   the public API
+src/                      the library (build/liblzfse_zazzcat.a)
+tools/cli.c               encode / decode / inspect command-line tool (build/lzfse-zazzcat)
+bench/bench.c             benchmark harness (section 6), with libcompression on macOS (build/lzfse-bench)
+tests/                    unit, stream, allocation and Apple interoperability tests
+fuzz/                     libFuzzer targets
+docs/                     this design, benchmark reports
+Makefile                  every build, test, sanitizer, fuzz and format target
 ```
 
 ### 4.2 Library modules
 
-| Module | Responsibility |
+| File | Responsibility |
 |---|---|
-| `format` | Block magics, header parsing and writing for v1 and v2 |
-| `bits` | Forward and backward bit writers and readers |
-| `fse` | Normalising frequency tables, building encode and decode tables, encoding and decoding |
-| `lzvn` | LZVN encoder and decoder |
-| `encode` | Match finder: two hash tables (section 4.2.1), lazy evaluation, skip-ahead; `encode::block` collects tokens and entropy-codes each block |
-| `block` | One LZFSE block: tokenise, then entropy-code, or the reverse |
-| `stream` | Splitting into blocks, choosing the block type, the end marker, the public API |
-| `parallel` | Block-parallel compression of independent chunks (decmpfs-style) |
-| `kernels` | Hot loops behind a narrow interface (section 5) |
+| `format.h`, `format.c` | Block magics, limits, value tables, header parsing and writing for v1 and v2 |
+| `bits.h` | Forward bit writer and backward bit reader |
+| `fse.h`, `fse.c` | Normalizing frequency tables, building encoder and decoder tables, encoding and decoding symbols |
+| `lzvn.h`, `lzvn.c` | LZVN encoder and decoder |
+| `copy.h` | Hot copy and compare loops: match lengths, exact and wide copies, the decoder's one-check token copy |
+| `decode.c` | The stream decoder: block dispatch, literal decoding, the token loop |
+| `encode.c` | Block-type choice, the large-input match finder (section 4.2.1), the encoder object |
+| `encode_small.c` | The 64 KiB fast-path match finder |
+| `encode_internal.h`, `encode_block.c` | The parse loop (greedy, one-step lazy, held-back match) and the block writer that entropy-codes each block |
+| `parallel.c` | Parallel compression of independent chunks on a persistent pthread pool (decmpfs-style) |
+| `decmpfs.c` | APFS transparent compression containers |
+| `stats.c` | Stream statistics for comparing encoders |
+| `common.h`, `common.c` | Little-endian loads and stores, the growable buffer, allocation hooks, status strings |
 
-**Public API**, sketch only:
-- Buffer encode and decode, mirroring `compression_encode_buffer`.
-- A streaming encoder and decoder.
-- `compress_chunks(input, chunk_size, threads)` for decmpfs-style independent 64 KiB blocks.
-- Every decode path enforces an explicit output-size limit.
+**Public API** (`include/lzfse_zazzcat.h`):
+- one-shot and reusable encoders and decoders (`lzfse_zazzcat_encode`, `lzfse_zazzcat_encoder_*`,
+  `lzfse_zazzcat_decode`, `lzfse_zazzcat_decode_into`, `lzfse_zazzcat_decoder_*`);
+- `lzfse_zazzcat_encode_chunks` for decmpfs-style independent 64 KiB chunks on all cores;
+- raw LZVN, decmpfs containers and stream statistics;
+- every decode path enforces an explicit output-size limit, and output grows in caller-owned buffers.
 
 #### 4.2.1 Match finder
 
@@ -221,7 +228,7 @@ Tried and not shipped:
 Hashing more bytes in the single table was tried first and rejected. It helped repetitive text but cost real
 binaries up to 8% of ratio, because they depend on 4–6-byte matches.
 
-Measured on a 4 MiB session-log-like input (`tests/apple.rs`, `session_like`):
+Measured on a 4 MiB session-log-like input (`tests/apple_tests.c`, `session_like`):
 
 | Encoder | 1 MiB chunks | Whole |
 |---|---:|---:|
@@ -232,7 +239,7 @@ Measured on a 4 MiB session-log-like input (`tests/apple.rs`, `session_like`):
 On real binaries, libraries, man pages, JSON and source, the change was 0.2–3% smaller with both tables, never
 larger.
 
-**64 KiB fast path** (`encode/small.rs`). Inputs of at most 64 KiB, which covers every APFS chunk and most files,
+**64 KiB fast path** (`src/encode_small.c`). Inputs of at most 64 KiB, which covers every APFS chunk and most files,
 use their own finder:
 - **16-bit positions:** the short table is 192 KiB and the long table 32 KiB, against 512 + 256 KiB for large inputs.
 - **Cleared on each call**, so no stale-entry checks are needed.
@@ -245,12 +252,16 @@ At 64 KiB chunks on real files it encodes 30–45% faster than the general finde
 
 ### 4.3 Safety boundary
 
-- **Safe reference path:** the library's portable path is safe Rust. The crate root uses `#![deny(unsafe_code)]`; the only exceptions are the copy kernels in `kernels`, which check their bounds once and are tested against safe references.
-- **Rules for any `unsafe`, C or assembly kernel:**
-  - It has a `// SAFETY:` justification.
-  - It sits behind the same interface as a safe Rust reference kernel.
-  - It is differentially fuzzed against that reference (section 7).
-  - Decoder kernels must enforce bounds themselves, because they process untrusted input.
+- **Untrusted input:** every read of the compressed stream is bounds-checked; sizes from headers are checked before
+  they are added to offsets, and those sums are done in 64 bits.
+- **Wide copies:** the decoder's hot path copies in 8- and 16-byte steps that may write past the end of a token.
+  `decode_token_fast` checks the room for a whole token once and declines anything near a buffer end, an invalid
+  distance or a long short-period run; those go to an exact, out-of-line path. Each kernel is tested against a
+  byte-by-byte version, including that it never writes past its slack.
+- **Checked by tools:** the tests run under AddressSanitizer and UndefinedBehaviorSanitizer in CI, and four
+  libFuzzer targets run on every push.
+- **Future NEON or assembly kernels** sit behind the same functions, are tested against the portable versions, and
+  enforce bounds themselves on the decoder side.
 
 ## 5. Performance plan and hot-loop backends
 
@@ -267,31 +278,31 @@ At 64 KiB chunks on real files it encodes 30–45% faster than the general finde
 
 ### 5.2 Backends
 
-- **Kernel variants:** each kernel has a portable Rust reference and optional variants:
-  - `rust-simd` (`std::arch::aarch64` NEON);
-  - `c` (built with the `cc` crate);
-  - `asm` (`core::arch::asm!` or `.S` files).
-- **Selection:** at compile time through Cargo features. Runtime CPU detection is used only where a variant needs more than the Apple M1 baseline.
-- **Same tests for every variant:** the test suite runs once per enabled backend.
+- **Portable C first:** every kernel is plain C. Unaligned loads and stores go through `memcpy` with a constant size,
+  which compilers turn into single instructions.
+- **Later variants:** NEON intrinsics (`arm_neon.h`) or assembly (`.S` files) behind the same functions, chosen at
+  compile time. Runtime CPU detection only where a variant needs more than the Apple M1 baseline.
+- **Same tests for every variant.** There is no inline assembly yet.
 
 ### 5.3 Parallelism
 
-- **The decmpfs case:** chunks are independent, so they are encoded on `rayon`'s persistent work-stealing pool.
-  - **Why `rayon`:** it keeps its threads alive between calls and can safely borrow the caller's input, which std's
-    scoped threads can only do by spawning fresh threads each call. Like every crate dependency, it is statically
-    linked.
-  - **Per-worker reuse:** each worker thread keeps its own `Encoder`, and chunk outputs go through a pool of reused
-    buffers.
-  - **`encode_chunks_into`:** writes the streams back to back plus an offset table, which is the resource-fork
-    layout. Once warmed up, it allocates nothing (`tests/alloc.rs`).
-- **One-shot functions:** `encode()` and `decode()` deliberately keep no global state. Long-lived callers reuse an
-  `Encoder` or `Decoder`, which allocates nothing per call.
+- **The decmpfs case:** chunks are independent, so they are encoded on a persistent pool of pthreads, one per CPU,
+  with the calling thread working too.
+  - **Tasks:** consecutive chunks are grouped into about 4 tasks per thread, claimed with an atomic counter. Each
+    task encodes into one buffer reserved up front.
+  - **Per-thread reuse:** each thread keeps its own encoder, and the task buffers and chunk-end table persist between
+    calls.
+  - **`lzfse_zazzcat_encode_chunks`:** writes the streams back to back plus an offset table, which is the resource-fork
+    layout. Once warmed up, it allocates nothing (`tests/alloc_tests.c`).
+  - **Without pthreads:** `-DLZFSE_ZAZZCAT_NO_THREADS` builds a serial version of the same API.
+- **One-shot functions:** `lzfse_zazzcat_encode` and `lzfse_zazzcat_decode` keep no global state. Long-lived callers
+  reuse an encoder or decoder object, which allocates nothing per call.
 - **Thread priority:** chosen through macOS QoS classes. User-initiated work runs on the P-cores. The `free-disk-space` daemon runs at utility or background priority on the E-cores.
 - **Large single streams:** blocks are **not** self-contained. A match may reach back into earlier blocks, because the decoder checks the distance against the whole output so far, up to 262,139 bytes. The repeat-distance state does reset at every block. So a single stream can only be encoded in parallel by cutting it into independent segments, at some cost in ratio. The decmpfs case does not have this problem, since every 64 KiB chunk is its own stream.
 
 ### 5.4 Build
 
-- `-C target-cpu=apple-m1` for Apple Silicon release builds. The M1 is the minimum supported chip.
+- `make CPU_FLAGS=-mcpu=apple-m1` for Apple Silicon release builds (`-O3`). The M1 is the minimum supported chip.
 - Later, if measurements show a gain, add separate builds tuned for M2, M3 and newer, picked at runtime. That is not part of the first version.
 - No Intel slice.
 - Profile-guided optimisation (PGO) is an optional later step.
@@ -343,7 +354,8 @@ Corpus files are downloaded by a script and never committed (licensing and size)
 - a cool-down between contenders, and the order of contenders rotated each run;
 - user-initiated QoS for single-thread runs.
 
-Every report records the chip model, core counts, macOS version, Rust version and commit hash.
+Every report records the chip model, core counts, macOS version, compiler and commit hash. Reports before 2026-11-14
+measured the Rust implementation.
 
 ### 6.6 Correctness gate
 
@@ -362,7 +374,7 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 ## 7. Testing
 
 - **Unit tests:** per module, such as FSE table construction, bit I/O, header round-trips and every LZVN opcode form.
-- **Round-trip property tests:** `proptest` over random and structured inputs, at every boundary (empty input, 1 byte, block-size multiples, maximum L, M and D).
+- **Round-trip tests:** random and structured inputs, at every boundary (empty input, 1 byte, block-size multiples, maximum L, M and D), plus truncation and bit-flip sweeps, all under AddressSanitizer and UndefinedBehaviorSanitizer in CI.
 - **Compatibility matrix:** run in CI on macOS against `libcompression`, and on Linux against the BSD reference.
 
   | Encoder ↓ / Decoder → | Ours | Apple | BSD ref |
@@ -373,7 +385,7 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 
 - **Golden vectors:** small committed streams produced by Apple's encoder, covering `bvx-`, `bvxn`, `bvx1` (if reachable) and `bvx2`.
 - **Fuzzing:**
-  - decoder on arbitrary bytes: errors only, no panics;
+  - decoder on arbitrary bytes (libFuzzer with AddressSanitizer): errors only, no crashes;
   - round-trip encode then decode;
   - differential kernel fuzzing, each backend against the reference;
   - differential decoding against the BSD reference.
@@ -389,14 +401,17 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 | M1 | Decoder: `bvx-`, `bvxn`, `bvx1`, `bvx2`, `bvx$` | It decodes Apple's output in CI and the decoder fuzz and property tests are clean | Done |
 | M2 | Scalar encoder: LZVN and LZFSE `bvx2` | The compatibility matrix is green and the ratio is within 2% of Apple's | Done: within ±0.6% |
 | M3 | Benchmark harness and first report | A reproducible baseline report against `libcompression` | Done: `docs/benchmarks` |
-| M4 | Optimisation: parallel chunks, then kernels (Rust, then NEON, then C or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential tests | In progress: parallel and literal-heavy cases beat Apple; single-threaded text and binary do not yet |
-| M5 | decmpfs writer and `free-disk-space` integration | Type 11/12 files read back through the kernel | Writer done and kernel-verified; wiring into `free-disk-space` waits for this crate to be merged |
+| M4 | Optimisation: parallel chunks, then kernels (portable C, then NEON or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential tests | In progress: parallel and literal-heavy cases beat Apple; single-threaded text and binary do not yet |
+| M5 | decmpfs writer and `free-disk-space` integration | Type 11/12 files read back through the kernel | Writer done and kernel-verified; wiring into `free-disk-space` not started |
+| M6 | Conversion from Rust to C | Byte-identical encoder output, all tests ported and green | Done: 220 test inputs encode identically; unit, Apple, allocation, sanitizer and fuzz tests ported |
 
 ## 9. Owner decisions
 
 1. **Chips:** the M1 is the minimum (the owner uses an M1 at home and an M3 at work).
 2. **Intel Macs:** not supported.
 3. **Ratio target:** no more than 0.5% worse than Apple's.
-4. **Crate name:** `lzfse-zazzcat`.
-5. **`no_std`:** supported. The library builds without `std`, using `alloc`. Threads and other OS-dependent parts need the default `std` feature.
+4. **Library name:** `lzfse-zazzcat` (C prefix `lzfse_zazzcat_`).
+5. **`no_std`:** decided for the Rust version. Its C counterpart is a library that needs only the C standard library,
+   with pthreads optional (`-DLZFSE_ZAZZCAT_NO_THREADS`).
 6. **Per-chip builds:** M2/M3-tuned builds come later, only if measured to help (section 5.4).
+7. **Language:** converted from Rust to C on 2026-11-14 (inline assembly was to be kept; there was none).

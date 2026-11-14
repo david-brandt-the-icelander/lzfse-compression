@@ -18,13 +18,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Run
-        env:
-          RUSTFLAGS: -C target-cpu=apple-m1
         run: |
-          cargo run --release -p lzfse-bench -- --runs 11 > report.md
+          make CPU_FLAGS=-mcpu=apple-m1 build/lzfse-bench
+          build/lzfse-bench --runs 11 > report.md
           cat report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
