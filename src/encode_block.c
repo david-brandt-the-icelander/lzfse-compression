@@ -28,6 +28,25 @@ void block_writer_free(block_writer *blocks) {
     blocks->literals = NULL;
 }
 
+// Count how often each byte value occurs in `literals[0 .. count)` (`count` a multiple of 4) into `counts`.
+// Each step loads 4 literals at once, and each of the 4 byte lanes has its own table of counts. With one table, a
+// run of equal bytes makes every step wait for the previous step's store to the same counter; with four, the lanes
+// update different counters and the steps overlap. The tables are added together at the end.
+static void count_literals(const uint8_t *literals, size_t count, uint32_t counts[LITERAL_SYMBOLS]) {
+    uint32_t lane_counts[4][LITERAL_SYMBOLS];
+    clear_bytes(lane_counts, sizeof lane_counts);
+    for (size_t i = 0; i < count; i += 4) {
+        uint32_t four = load_u32(literals + i);
+        lane_counts[0][four & 0xFF]++;
+        lane_counts[1][(four >> 8) & 0xFF]++;
+        lane_counts[2][(four >> 16) & 0xFF]++;
+        lane_counts[3][four >> 24]++;
+    }
+    for (size_t s = 0; s < LITERAL_SYMBOLS; s++) {
+        counts[s] = lane_counts[0][s] + lane_counts[1][s] + lane_counts[2][s] + lane_counts[3][s];
+    }
+}
+
 // Entropy-code the buffered tokens and literals as a `bvx2` block appended to `output`.
 static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buffer *output) {
     // The literal stream encodes 4 literals per step, so pad the literals with zeros to a multiple of 4.
@@ -69,8 +88,8 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     header.literal_length_state = 0;
     header.match_length_state = 0;
     header.distance_state = 0;
-    uint32_t literal_counts[LITERAL_SYMBOLS] = {0};
-    for (size_t i = 0; i < literal_count; i++) literal_counts[literals[i]]++;
+    uint32_t literal_counts[LITERAL_SYMBOLS];
+    count_literals(literals, literal_count, literal_counts);
     uint32_t literal_length_counts[LITERAL_LENGTH_SYMBOLS] = {0};
     uint32_t match_length_counts[MATCH_LENGTH_SYMBOLS] = {0};
     uint32_t distance_counts[DISTANCE_SYMBOLS] = {0};
