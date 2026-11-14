@@ -109,7 +109,8 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
 
     // Literals: four interleaved states, encoded last group first so the decoder reads them forwards.
     size_t literal_stream_start = output->length;
-    bit_writer writer = {0, 0};
+    bit_writer writer;
+    bit_writer_start(&writer, output);
     uint32_t states[4] = {0, 0, 0, 0};
     for (size_t group = literal_count; group > 0; group -= 4) {
         const uint8_t *four = literals + group - 4;
@@ -117,7 +118,7 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
         fse_encode(&states[2], &literal_encoder[four[2]], &writer);
         fse_encode(&states[1], &literal_encoder[four[1]], &writer);
         fse_encode(&states[0], &literal_encoder[four[0]], &writer);
-        bit_writer_flush(&writer, output);
+        bit_writer_flush(&writer);
     }
     header.literal_padding_bits = bit_writer_finish(&writer, output);
     for (int i = 0; i < 4; i++) header.literal_states[i] = (uint16_t)states[i];
@@ -128,7 +129,7 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     size_t token_stream_start = output->length;
     clear_bytes(output->data + output->length, 8);
     output->length += 8;
-    writer = (bit_writer){0, 0};
+    bit_writer_start(&writer, output);
     uint32_t literal_length_state = 0, match_length_state = 0, distance_state = 0;
     for (size_t t = token_count; t > 0; t--) {
         const token *tk = &tokens[t - 1];
@@ -139,7 +140,7 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
         fse_encode(&match_length_state, &match_length_encoder[m], &writer);
         bit_writer_push(&writer, literal_length_extra_bits[l], tk->literal_length - literal_length_base[l]);
         fse_encode(&literal_length_state, &literal_length_encoder[l], &writer);
-        bit_writer_flush(&writer, output);
+        bit_writer_flush(&writer);
     }
     header.token_padding_bits = bit_writer_finish(&writer, output);
     header.literal_length_state = (uint16_t)literal_length_state;

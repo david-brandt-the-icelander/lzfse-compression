@@ -84,6 +84,24 @@ static const uint8_t opcode_kinds[256] = {
 #undef LM
 #undef EIGHT
 
+// Execute an opcode the fast path declined, with exact copies: `literal_length` literals from `literals` (all in
+// the stream), then `match_length` bytes (0 for none) from `distance` back, to `output + position`. Kept out of
+// line, as decode_token_slow is in decode.c: its calls (copy_bytes is memcpy) would otherwise sit inside the
+// decoding loop, which then keeps its values in the few registers a call preserves, or on the stack.
+static COLD PRESERVE_REGISTERS lzfse_zazzcat_status decode_opcode_slow(uint8_t *output, size_t output_capacity,
+                                                                       size_t position, const uint8_t *literals,
+                                                                       size_t literal_length, size_t distance,
+                                                                       size_t match_length) {
+    if (literal_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
+    copy_bytes(output + position, literals, literal_length);
+    position += literal_length;
+    if (match_length == 0) return LZFSE_ZAZZCAT_OK;
+    if (distance == 0 || distance > position) return LZFSE_ZAZZCAT_CORRUPT;
+    if (match_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
+    copy_match_exact(output, position, distance, match_length);
+    return LZFSE_ZAZZCAT_OK;
+}
+
 // Run opcodes from `source` into `output` starting at `position` until end-of-stream. Store the number of source
 // bytes used and the output end position.
 static lzfse_zazzcat_status decode_run(const uint8_t *source, size_t source_length, uint8_t *output,
@@ -172,28 +190,17 @@ static lzfse_zazzcat_status decode_run(const uint8_t *source, size_t source_leng
         // Fast path: the shared wide-copy token routine, which makes no calls. The literals sit in the stream
         // right after the opcode. A literal-only opcode passes match length 0 and distance 1, which always passes
         // its distance check because it carries at least one literal. Anything near either buffer's end, or
-        // invalid (such as a previous distance of 0), falls through to the exact copies below.
-        if (decode_token_fast(output, output_capacity, position, source, source_length, at, literal_length, distance,
-                              match_length)) {
-            at += literal_length;
-            position += literal_length + match_length;
-            // Every opcode with a match has a match length of at least 1.
-            if (match_length != 0) previous_distance = distance;
-            continue;
+        // invalid (such as a previous distance of 0), goes to decode_opcode_slow instead.
+        if (!decode_token_fast(output, output_capacity, position, source, source_length, at, literal_length, distance,
+                               match_length)) {
+            lzfse_zazzcat_status status = decode_opcode_slow(output, output_capacity, position, source + at,
+                                                             literal_length, distance, match_length);
+            if (status != LZFSE_ZAZZCAT_OK) return status;
         }
-        if (literal_length > 0) {
-            if (literal_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
-            copy_bytes(output + position, source + at, literal_length);
-            at += literal_length;
-            position += literal_length;
-        }
-        if (match_length != 0) {
-            if (distance == 0 || distance > position) return LZFSE_ZAZZCAT_CORRUPT;
-            if (match_length > output_capacity - position) return LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL;
-            copy_match_exact(output, position, distance, match_length);
-            position += match_length;
-            previous_distance = distance;
-        }
+        at += literal_length;
+        position += literal_length + match_length;
+        // Every opcode with a match has a match length of at least 1.
+        if (match_length != 0) previous_distance = distance;
     }
 }
 
@@ -219,82 +226,94 @@ static size_t max_short_match(size_t literal_count) {
     return limits[literal_count];
 }
 
+// The functions below append opcodes at `at`, a cursor into the output's reserved space, and return the advanced
+// cursor; lzvn_encode_with_table sets the buffer's length once at the end. Pushing through the buffer would store
+// `length` and load `data` and `length` again after every byte, since a byte store may change any memory.
+
 // Append literal-only opcodes for `count` bytes at `literals`, of which `readable` bytes may be read. When at least
 // 16 bytes beyond each piece may be read, the piece is copied with wild_copy, which can write up to 15 bytes past
 // it; the output's reservation (2 bytes per input byte plus 64) leaves room, and later output overwrites them.
-static void emit_literals(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_t count, size_t readable) {
+static uint8_t *emit_literals(uint8_t *at, const uint8_t *literals, size_t count, size_t readable) {
     while (count > 0) {
         size_t n = min_size(count, 271);
         if (n >= 16) {
-            buffer_push_2_reserved(out, 0xE0, (uint8_t)(n - 16));
+            at[0] = 0xE0;
+            at[1] = (uint8_t)(n - 16);
+            at += 2;
         } else {
-            buffer_push_reserved(out, (uint8_t)(0xE0 | n));
+            *at++ = (uint8_t)(0xE0 | n);
         }
         if (n + 16 <= readable) {
-            wild_copy(out->data + out->length, literals, n);
-            out->length += n;
+            wild_copy(at, literals, n);
         } else {
-            buffer_append_reserved(out, literals, n);
+            copy_bytes(at, literals, n);
         }
+        at += n;
         literals += n;
         readable -= n;
         count -= n;
     }
+    return at;
 }
 
 // Append match-only opcodes that repeat the previous distance for `length` bytes.
-static void emit_repeat(lzfse_zazzcat_buffer *out, size_t length) {
+static uint8_t *emit_repeat(uint8_t *at, size_t length) {
     while (length > 0) {
         size_t n = min_size(length, 271);
         if (n >= 16) {
-            buffer_push_2_reserved(out, 0xF0, (uint8_t)(n - 16));
+            at[0] = 0xF0;
+            at[1] = (uint8_t)(n - 16);
+            at += 2;
         } else {
-            buffer_push_reserved(out, (uint8_t)(0xF0 | n));
+            *at++ = (uint8_t)(0xF0 | n);
         }
         length -= n;
     }
+    return at;
 }
 
 // Append the opcodes for `literal_count` literals followed by a match of `length` (>= 3) bytes at `distance`
 // (<= 65535). Up to 3 literals ride along in the match opcode; more go in a literal opcode of their own.
 // `readable` is how many bytes may be read from `literals` (to the end of the input).
-static void emit_token(lzfse_zazzcat_buffer *out, const uint8_t *literals, size_t literal_count, size_t length,
-                       size_t distance, size_t previous_distance, size_t readable) {
+static uint8_t *emit_token(uint8_t *at, const uint8_t *literals, size_t literal_count, size_t length, size_t distance,
+                           size_t previous_distance, size_t readable) {
     // From here on `literal_count` counts only the literals that ride along in the match opcode.
     if (literal_count > 3) {
-        emit_literals(out, literals, literal_count, readable);
+        at = emit_literals(at, literals, literal_count, readable);
         literal_count = 0;
     }
-    if (distance == previous_distance && literal_count == 0) {
-        emit_repeat(out, length);
-        return;
-    }
+    if (distance == previous_distance && literal_count == 0) return emit_repeat(at, length);
     size_t first;
     if (distance == previous_distance) {
         first = min_size(length, max_short_match(literal_count));
-        buffer_push_reserved(out, (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 6));
+        *at++ = (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 6);
     } else if (distance < 16384 && (length > max_short_match(literal_count) || distance >= 1536)) {
         first = min_size(length, 34);
         size_t word = (distance << 2) | ((first - 3) & 3);
-        buffer_push_3_reserved(out, (uint8_t)(0xA0 | (literal_count << 3) | ((first - 3) >> 2)), (uint8_t)word,
-                               (uint8_t)(word >> 8));
+        at[0] = (uint8_t)(0xA0 | (literal_count << 3) | ((first - 3) >> 2));
+        at[1] = (uint8_t)word;
+        at[2] = (uint8_t)(word >> 8);
+        at += 3;
     } else if (distance < 1536) {
         first = min_size(length, max_short_match(literal_count));
-        buffer_push_2_reserved(out, (uint8_t)((literal_count << 6) | ((first - 3) << 3) | (distance >> 8)),
-                               (uint8_t)distance);
+        at[0] = (uint8_t)((literal_count << 6) | ((first - 3) << 3) | (distance >> 8));
+        at[1] = (uint8_t)distance;
+        at += 2;
     } else {
         first = min_size(length, max_short_match(literal_count));
-        buffer_push_3_reserved(out, (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 7), (uint8_t)distance,
-                               (uint8_t)(distance >> 8));
+        at[0] = (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 7);
+        at[1] = (uint8_t)distance;
+        at[2] = (uint8_t)(distance >> 8);
+        at += 3;
     }
     if (literal_count > 0) {
         // Copy 4 bytes, a constant size the compiler turns into one load and one store, and keep 1 to 3 of them.
         // Reading 4 is safe: the match of at least 3 bytes follows the literals. The extra written bytes are
         // overwritten by the next output (at least the 8-byte end-of-stream trailer follows).
-        store_u32(out->data + out->length, load_u32(literals));
-        out->length += literal_count;
+        store_u32(at, load_u32(literals));
+        at += literal_count;
     }
-    emit_repeat(out, length - first);
+    return emit_repeat(at, length - first);
 }
 
 // Hash 4 bytes into a table index (multiplicative hashing: the top bits of the product).
@@ -322,6 +341,7 @@ lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzf
     uint32_t *slots = table->entries;
     clear_bytes(slots, entries * sizeof *slots);
     uint32_t shift = 32 - bits;
+    uint8_t *at = out->data + out->length;
     size_t i = 0, literal_start = 0, previous_distance = 0;
     while (i + 4 <= n) {
         uint32_t four = load_u32(source + i);
@@ -355,8 +375,8 @@ lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzf
         size_t back = match_length_backward(source, i - best_distance, i, i - literal_start);
         size_t start = i - back;
         size_t length = best_length + back;
-        emit_token(out, source + literal_start, start - literal_start, length, best_distance, previous_distance,
-                   n - literal_start);
+        at = emit_token(at, source + literal_start, start - literal_start, length, best_distance, previous_distance,
+                        n - literal_start);
         previous_distance = best_distance;
         size_t end = start + length;
         for (size_t j = i + 1; j + 4 <= n && j < end; j++)
@@ -364,9 +384,10 @@ lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzf
         i = end;
         literal_start = end;
     }
-    emit_literals(out, source + literal_start, n - literal_start, n - literal_start);
+    at = emit_literals(at, source + literal_start, n - literal_start, n - literal_start);
     static const uint8_t trailer[8] = {END_OF_STREAM_OPCODE, 0, 0, 0, 0, 0, 0, 0};
-    buffer_append_reserved(out, trailer, 8);
+    copy_bytes(at, trailer, 8);
+    out->length = (size_t)(at + 8 - out->data);
     return LZFSE_ZAZZCAT_OK;
 }
 
