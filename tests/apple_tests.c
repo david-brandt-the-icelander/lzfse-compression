@@ -290,7 +290,7 @@ static void find_compressed_files(const char *directory, size_t max, char (*path
 // Files macOS itself compressed decode with our decmpfs parser to the same bytes the kernel returns.
 static void test_system_compressed_files(void) {
     size_t max = 16000, count = 0;
-    char (*paths)[512] = raw_malloc(max * 512);
+    char(*paths)[512] = raw_malloc(max * 512);
     const char *directories[] = {"/usr/bin", "/usr/libexec", "/System/Library/CoreServices",
                                  "/System/Library/Frameworks"};
     for (int i = 0; i < 4; i++) find_compressed_files(directories[i], count + 4000, paths, &count);
