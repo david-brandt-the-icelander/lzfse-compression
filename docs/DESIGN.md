@@ -401,7 +401,7 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 | M1 | Decoder: `bvx-`, `bvxn`, `bvx1`, `bvx2`, `bvx$` | It decodes Apple's output in CI and the decoder fuzz and property tests are clean | Done |
 | M2 | Scalar encoder: LZVN and LZFSE `bvx2` | The compatibility matrix is green and the ratio is within 2% of Apple's | Done: within ±0.6% |
 | M3 | Benchmark harness and first report | A reproducible baseline report against `libcompression` | Done: `docs/benchmarks` |
-| M4 | Optimisation: parallel chunks, then kernels (portable C, then NEON or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential tests | In progress: parallel and literal-heavy cases beat Apple; single-threaded text and binary do not yet |
+| M4 | Optimisation: parallel chunks, then kernels (portable C, then NEON or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential tests | In progress: everything but single-threaded binary decoding (1–5% behind) beats Apple on the M1 Pro |
 | M5 | decmpfs writer and `free-disk-space` integration | Type 11/12 files read back through the kernel | Writer done and kernel-verified; wiring into `free-disk-space` not started |
 | M6 | Conversion from Rust to C | Byte-identical encoder output, all tests ported and green | Done: 220 test inputs encode identically; unit, Apple, allocation, sanitizer and fuzz tests ported |
 
