@@ -184,19 +184,36 @@ impl Encoder {
     }
 }
 
+/// EXPERIMENT (temporary): the build-time parse switches this crate was compiled with, for benchmark reports.
+#[doc(hidden)]
+pub fn experiment() -> (&'static str, &'static str) {
+    (
+        option_env!("LZFSE_MERGE").map_or("off", |_| "on"),
+        option_env!("LZFSE_INSIDE").unwrap_or("edge"),
+    )
+}
+
 // A match finder: the best match at a position, and indexing of positions skipped over by matches.
 trait Find {
     // Find the best match at `i` (not starting before `lit`), checking the previous distance too, and index `i`.
     fn find(&mut self, i: usize, lit: usize, d_prev: usize) -> Option<Match>;
     // Index position `i` without searching.
     fn insert(&mut self, i: usize);
+    // Index position `i` in the long table only.
+    fn insert_long(&mut self, i: usize);
 }
 
 // Tokenise `src` with match finder `f` (greedy with one-step lazy evaluation) and write its blocks to `out`.
 #[inline(always)]
 fn parse<F: Find>(src: &[u8], f: &mut F, blocks: &mut Blocks, opts: &Options, out: &mut Vec<u8>) {
     let limit = src.len().saturating_sub(8);
+    // EXPERIMENT (temporary): build-time switches for comparing parse variants on the owner's data; see
+    // `experiment()`. They will be replaced by the winning behaviour.
+    let merge = option_env!("LZFSE_MERGE").is_some();
+    let inside = option_env!("LZFSE_INSIDE").unwrap_or("edge");
     let (mut i, mut lit, mut d_prev, mut misses) = (0usize, 0usize, 0usize, 0usize);
+    // The last match found, not yet emitted: a later match may still swallow it. Its literals start at `lit`.
+    let mut pend: Option<Match> = None;
     while i < limit {
         let Some(mut m) = f.find(i, lit, d_prev) else {
             misses += 1;
@@ -215,21 +232,43 @@ fn parse<F: Find>(src: &[u8], f: &mut F, blocks: &mut Blocks, opts: &Options, ou
                 }
             }
         }
-        blocks.push(src, lit, m.start, m.len as u32, m.dist as u32, out);
+        // Emit the held match, unless the new one reaches back over all of it (with LZFSE_MERGE) and replaces it.
+        // A new match that reaches back only partly is cut where the held one ends.
+        if let Some(p) = pend {
+            let p_end = p.start + p.len;
+            if !(merge && m.start <= p.start) {
+                if m.start < p_end {
+                    let cut = p_end - m.start;
+                    m.start += cut;
+                    m.len -= cut;
+                }
+                blocks.push(src, lit, p.start, p.len as u32, p.dist as u32, out);
+                lit = p_end;
+            }
+        }
+        pend = Some(m);
         d_prev = m.dist;
         let end = m.start + m.len;
-        // Index positions inside the match so later data can refer to them; long matches only at their edges.
+        // Index positions inside the match so later data can refer to them. By default long matches are indexed
+        // only at their edges; LZFSE_INSIDE=long also indexes their interior in the long table, =all in both.
         let mut j = (i + 2).max(m.start + 1);
         while j < end.min(limit) {
-            f.insert(j);
-            j += if m.len > 64 && j + 16 < end && j > m.start + 16 {
-                end - 16 - j
+            let edge = !(m.len > 64 && j + 16 < end && j > m.start + 16);
+            if inside == "all" || edge {
+                f.insert(j);
+                j += 1;
+            } else if inside == "long" {
+                f.insert_long(j);
+                j += 1;
             } else {
-                1
-            };
+                j = end - 16;
+            }
         }
         i = end;
-        lit = end;
+    }
+    if let Some(p) = pend {
+        blocks.push(src, lit, p.start, p.len as u32, p.dist as u32, out);
+        lit = p.start + p.len;
     }
     blocks.push(src, lit, src.len(), 0, 0, out);
     blocks.flush(src, out);
@@ -285,6 +324,13 @@ impl Finder<'_> {
 }
 
 impl Find for Finder<'_> {
+    // Record position `i` in the long table only.
+    #[inline(always)]
+    fn insert_long(&mut self, i: usize) {
+        let lh = self.lhash(load8(self.src, i));
+        self.long[lh] = self.base + i as u32;
+    }
+
     // Record position `i` in both tables.
     #[inline(always)]
     fn insert(&mut self, i: usize) {

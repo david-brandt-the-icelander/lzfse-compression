@@ -36,6 +36,8 @@ mod parallel;
 pub mod stats;
 
 pub use decode::{decode, decode_into, decoded_len, Decoder};
+#[doc(hidden)]
+pub use encode::experiment;
 pub use encode::{encode, encode_with, Encoder, Options, LZVN_THRESHOLD};
 pub use error::Error;
 #[cfg(feature = "std")]

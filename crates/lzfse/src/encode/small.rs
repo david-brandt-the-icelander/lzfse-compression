@@ -117,6 +117,13 @@ impl<'a, const BITS: u32> SmallFinder<'a, BITS> {
 }
 
 impl<const BITS: u32> Find for SmallFinder<'_, BITS> {
+    // Record position `i` in the long table only.
+    #[inline(always)]
+    fn insert_long(&mut self, i: usize) {
+        let lh = self.lhash(load8(self.src, i));
+        self.long[lh] = i as u16;
+    }
+
     // Record position `i` in both tables.
     #[inline(always)]
     fn insert(&mut self, i: usize) {

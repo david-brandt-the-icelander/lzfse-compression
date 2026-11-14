@@ -206,7 +206,7 @@ fn ours<'a>(
     chunk: usize,
     threads: usize,
 ) -> Contender<'a> {
-    let opts = lzfse::Options::default();
+    let opts = options();
     let encode_all = move || -> Vec<Vec<u8>> {
         if threads > 1 {
             lzfse::encode_chunks_with(data, chunk, &opts)
@@ -380,6 +380,7 @@ fn report(rows: &[Row], threads: usize) {
         }
     }
     println!("- Threads for the parallel rows: {threads}");
+    println!("- Our encoder: {}", variant());
     println!("- Throughput is MB/s (10^6 bytes) of uncompressed data: the median of the timed runs, with the contenders interleaved run by run.\n");
     println!("| Input | Shape | Contender | Ratio | Encode MB/s | Decode MB/s |");
     println!("|---|---|---|---:|---:|---:|");
@@ -394,6 +395,28 @@ fn report(rows: &[Row], threads: usize) {
             r.dec_mbs
         );
     }
+}
+
+// EXPERIMENT (temporary): our encoder's options, with LZFSE_HB, LZFSE_LAZY and LZFSE_GOOD overriding the defaults.
+fn options() -> lzfse::Options {
+    let d = lzfse::Options::default();
+    let get = |k: &str, v: usize| env::var(k).ok().and_then(|x| x.parse().ok()).unwrap_or(v);
+    lzfse::Options {
+        hash_bits: get("LZFSE_HB", d.hash_bits as usize) as u32,
+        lazy_below: get("LZFSE_LAZY", d.lazy_below),
+        good_match: get("LZFSE_GOOD", d.good_match),
+        ..d
+    }
+}
+
+// EXPERIMENT (temporary): one line naming the encoder variant measured.
+fn variant() -> String {
+    let (merge, inside) = lzfse::experiment();
+    let o = options();
+    format!(
+        "merge {merge}, inside {inside}, hash bits {}, lazy below {}, good match {}",
+        o.hash_bits, o.lazy_below, o.good_match
+    )
 }
 
 // Print one encoder's stream statistics for one input and shape as a Markdown block.
@@ -446,12 +469,13 @@ fn print_stats(input: &str, shape: &str, who: &str, s: &lzfse::stats::StreamStat
 
 // For every input and shape, encode with each encoder and print what it chose.
 fn stats_mode(inputs: &[Input], chunks: &[usize]) {
+    println!("Our encoder: {}\n", variant());
     for input in inputs {
         for &chunk in chunks {
             let chunk = chunk.min(input.data.len().max(1));
             let s = shape(chunk, input.data.len());
             let mut ours = lzfse::stats::StreamStats::default();
-            let mut enc = lzfse::Encoder::new(lzfse::Options::default());
+            let mut enc = lzfse::Encoder::new(options());
             let mut out = Vec::new();
             for piece in input.data.chunks(chunk) {
                 out.clear();
