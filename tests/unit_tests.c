@@ -180,14 +180,15 @@ static void test_bits_read_back_in_reverse(void) {
         bare_buffer_reserve(&out, 4096);
         clear_bytes(out.data, 8);
         out.length = 8;
-        bit_writer writer = {0, 0};
+        bit_writer writer;
+        bit_writer_start(&writer, &out);
         uint32_t counts[200];
         uint64_t values[200];
         for (uint32_t i = 0; i < 200; i++) {
             counts[i] = i % 17 + extra % 3;
             values[i] = ((uint64_t)i * 2654435761u) & ((1ull << counts[i]) - 1);
             bit_writer_push(&writer, counts[i], values[i]);
-            bit_writer_flush(&writer, &out);
+            bit_writer_flush(&writer);
         }
         int32_t padding = bit_writer_finish(&writer, &out);
         CHECK(padding >= -7 && padding <= 0, "padding %d", padding);
@@ -260,11 +261,12 @@ static void test_fse_literals_round_trip(void) {
         bare_buffer_reserve(&out, 16000);
         clear_bytes(out.data, 8);
         out.length = 8;
-        bit_writer writer = {0, 0};
+        bit_writer writer;
+        bit_writer_start(&writer, &out);
         uint32_t state = 0;
         for (int i = 4999; i >= 0; i--) {
             fse_encode(&state, &encoder[data[i]], &writer);
-            bit_writer_flush(&writer, &out);
+            bit_writer_flush(&writer);
         }
         int32_t padding = bit_writer_finish(&writer, &out);
         // Pad the frequencies to a full literal table so the literal decoder can read them.
@@ -294,7 +296,8 @@ static void test_single_symbol_uses_no_bits(void) {
     fse_encoder_table(frequencies, 4, 64, encoder);
     lzfse_zazzcat_buffer out = {0};
     bare_buffer_reserve(&out, 64);
-    bit_writer writer = {0, 0};
+    bit_writer writer;
+    bit_writer_start(&writer, &out);
     uint32_t state = 0;
     for (int i = 0; i < 100; i++) fse_encode(&state, &encoder[2], &writer);
     CHECK(bit_writer_finish(&writer, &out) == 0 && out.length == 0, "no bits written");

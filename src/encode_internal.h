@@ -37,29 +37,38 @@ lzfse_zazzcat_status block_writer_reset(block_writer *blocks);
 void block_writer_free(block_writer *blocks);
 
 // Encode the buffered tokens as one block (or as a raw block if that is smaller) and append it to `output`.
+// A plain call, although the parse loop makes it only about once per block: marking it COLD and
+// PRESERVE_REGISTERS, as decode_token_slow is, made the encoder slower (see
+// blogs/2026-11-14-keeping-values-in-registers.md).
 void block_writer_flush(block_writer *blocks, const uint8_t *source, lzfse_zazzcat_buffer *output);
 
-// Append one token whose values are in range, closing the block first if it is full.
+// Append one token whose values are in range, closing the block first if it is full. Each field of `blocks` is
+// read once into a local: the literal copy stores bytes, and a byte store may change any memory, `*blocks`
+// included, so a field read again after it would be loaded again.
 ALWAYS_INLINE void block_writer_token(block_writer *blocks, const uint8_t *source, size_t source_length,
                                       size_t literal_start, size_t literal_length, uint32_t length, uint32_t distance,
                                       lzfse_zazzcat_buffer *output) {
     if (blocks->token_count + 1 > TOKENS_PER_BLOCK || blocks->literal_count + literal_length + 3 > LITERALS_PER_BLOCK) {
         block_writer_flush(blocks, source, output);
     }
-    token *t = &blocks->tokens[blocks->token_count++];
+    size_t token_count = blocks->token_count;
+    size_t literal_count = blocks->literal_count;
+    size_t covered_bytes = blocks->covered_bytes;
+    token *t = &blocks->tokens[token_count];
+    uint8_t *literal_destination = blocks->literals + literal_count;
+    blocks->token_count = token_count + 1;
+    blocks->literal_count = literal_count + literal_length;
+    blocks->covered_bytes = covered_bytes + literal_length + length;
     t->literal_length = (uint32_t)literal_length;
     t->match_length = length;
     t->distance = distance;
     // Wide copy of the literals; any overshoot lands in the slack and the next literals overwrite it. Near the end
     // of the input there may be fewer than 16 spare bytes to read, so copy exactly there.
-    uint8_t *literal_destination = blocks->literals + blocks->literal_count;
     if (literal_start + literal_length + 16 <= source_length) {
         wild_copy(literal_destination, source + literal_start, literal_length);
     } else {
         copy_bytes(literal_destination, source + literal_start, literal_length);
     }
-    blocks->literal_count += literal_length;
-    blocks->covered_bytes += literal_length + length;
 }
 
 // Add the literals source[literal_start .. literal_end) followed by a match of `length` bytes at `distance`
@@ -106,6 +115,10 @@ typedef void (*insert_function)(void *finder, size_t position);
 ALWAYS_INLINE void parse(const uint8_t *source, size_t source_length, void *finder, find_function find,
                          insert_function insert, insert_function insert_long, block_writer *blocks,
                          const lzfse_zazzcat_options *options, lzfse_zazzcat_buffer *output) {
+    // The options as locals: read through `options` they would be loaded again after every table or literal store
+    // (which, as far as the compiler knows, might change them).
+    uint32_t skip_shift = options->skip_shift;
+    size_t lazy_below = options->lazy_below;
     // The finders read 8 bytes at a position, so they stop 8 bytes before the end.
     size_t limit = source_length > 8 ? source_length - 8 : 0;
     size_t position = 0, literal_start = 0, previous_distance = 0, misses = 0;
@@ -117,11 +130,11 @@ ALWAYS_INLINE void parse(const uint8_t *source, size_t source_length, void *find
         if (m.length == 0) {
             misses++;
             // After many misses in a row (incompressible data), step further ahead each time.
-            position += options->skip_shift == 0 ? 1 : 1 + (misses >> options->skip_shift);
+            position += skip_shift == 0 ? 1 : 1 + (misses >> skip_shift);
             continue;
         }
         misses = 0;
-        if (m.length < options->lazy_below && position + 1 < limit) {
+        if (m.length < lazy_below && position + 1 < limit) {
             match next = find(finder, position + 1, literal_start, previous_distance);
             if (next.length > m.length) m = next;
         }

@@ -150,9 +150,12 @@ lzfse_zazzcat_status encode_small(const uint8_t *source, size_t length, small_fi
         first.positions[k] = 0;
         first.values[k] = load_u32(source);
     }
-    for (size_t i = 0; i < bucket_count; i++) tables->buckets[i] = first;
+    // Through a local pointer: each bucket store may (as far as the compiler knows) change `tables->buckets`, so
+    // reading it in the loop would load it again for every bucket.
+    small_bucket *buckets = tables->buckets;
+    for (size_t i = 0; i < bucket_count; i++) buckets[i] = first;
     clear_bytes(tables->long_slots, long_count * sizeof *tables->long_slots);
-    small_finder finder = {source, length, tables->buckets, tables->long_slots, options->good_match};
+    small_finder finder = {source, length, buckets, tables->long_slots, options->good_match};
     switch (bits) {
     case 10:
         parse(source, length, &finder, small_find_10, small_insert_10, small_insert_long_10, blocks, options, output);
