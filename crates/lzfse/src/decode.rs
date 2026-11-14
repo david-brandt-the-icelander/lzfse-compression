@@ -254,6 +254,12 @@ fn token_slow(dst: &mut [u8], pos: usize, lits: &[u8], d: usize, m: usize) -> Re
         return Err(Error::OutputTooSmall);
     }
     dst[pos..end].copy_from_slice(lits);
-    copy_match_cold(dst, end, d, m);
+    if d == 1 {
+        // A run of one byte (zeros, padding): memset speed.
+        let b = dst[end - 1];
+        dst[end..end + m].fill(b);
+    } else {
+        copy_match_cold(dst, end, d, m);
+    }
     Ok(())
 }
