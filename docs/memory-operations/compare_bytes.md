@@ -4,9 +4,10 @@ Shared rules and decisions: [README](README.md).
 
 ## Where it is called
 
-Its one library caller is the 4-byte magic check in `decmpfs.c`. All other callers are tests, the benchmark's
-correctness gate and the fuzz targets. The encoders find matches with `match_length` in `src/copy.h`, which XORs
-8 bytes at a time and does not call `compare_bytes`.
+Every caller checks for equality, so they call `equal_bytes`, which wraps it. Its one library caller is the
+4-byte magic check in `decmpfs.c`. All other callers are tests, the benchmark's correctness gate and the fuzz
+targets. The encoders find matches with `match_length` in `src/copy.h`, which XORs 8 bytes at a time and does
+not call `compare_bytes`.
 
 ## Assessment
 

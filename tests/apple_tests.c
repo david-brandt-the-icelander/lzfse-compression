@@ -42,7 +42,7 @@ static int apple_decodes_to(const lzfse_zazzcat_buffer *stream, const uint8_t *d
                             compression_algorithm algorithm) {
     uint8_t *out = raw_malloc(n + 1);
     size_t got = compression_decode_buffer(out, n + 1, stream->data, stream->length, NULL, algorithm);
-    int same = got == n && (n == 0 || compare_bytes(out, data, n) == 0);
+    int same = got == n && (n == 0 || equal_bytes(out, data, n));
     raw_free(out);
     return same;
 }

@@ -15,7 +15,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     uint8_t *into = raw_malloc(capacity);
     lzfse_zazzcat_status into_status = lzfse_zazzcat_decode_into(data, size, into, capacity, &written);
     if (whole_status == LZFSE_ZAZZCAT_OK && into_status == LZFSE_ZAZZCAT_OK) {
-        if (written != whole.length || (written > 0 && compare_bytes(into, whole.data, written) != 0)) abort();
+        if (written != whole.length || (written > 0 && !equal_bytes(into, whole.data, written))) abort();
     }
     raw_free(into);
     lzfse_zazzcat_buffer_free(&whole);

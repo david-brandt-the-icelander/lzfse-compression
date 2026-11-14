@@ -95,7 +95,7 @@ static inline lzfse_zazzcat_buffer copy_of(const void *data, size_t n) {
 
 // True when two byte ranges are equal (and of equal length).
 static inline int same_bytes(const void *a, size_t a_length, const void *b, size_t b_length) {
-    return a_length == b_length && (a_length == 0 || compare_bytes(a, b, a_length) == 0);
+    return a_length == b_length && (a_length == 0 || equal_bytes(a, b, a_length));
 }
 
 #endif

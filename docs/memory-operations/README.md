@@ -8,7 +8,7 @@ Status: proposed, nothing implemented. One document per wrapper:
 | [`move_bytes`](move_bytes.md) | `copy_match_exact` only | cold path | switch the call to `copy_bytes`; no backend |
 | [`fill_bytes`](fill_bytes.md) | decoder slow path, one-byte runs | rare | none |
 | [`clear_bytes`](clear_bytes.md) | struct and header zeroing, per-call table resets | small share | none; clear less, not faster |
-| [`compare_bytes`](compare_bytes.md) | one 4-byte magic check | no | none |
+| [`compare_bytes`](compare_bytes.md) | one 4-byte magic check, via `equal_bytes` | no | none |
 
 ## Scope
 

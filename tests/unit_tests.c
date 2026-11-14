@@ -131,18 +131,18 @@ static block_header sample_header(void) {
 
 static void test_headers_round_trip(void) {
     block_header h = sample_header(), back;
-    // The parsers set every field but not the struct's padding bytes, which compare_bytes also compares.
+    // The parsers set every field but not the struct's padding bytes, which equal_bytes also compares.
     clear_bytes(&back, sizeof back);
     CHECK(block_header_validate(&h) == LZFSE_ZAZZCAT_OK, "sample header is valid");
     lzfse_zazzcat_buffer v2 = {0}, v1 = {0};
     size_t size = write_v2_header(&h, &v2), parsed_size = 0;
     CHECK(size == v2.length, "v2 size");
     CHECK(parse_v2_header(v2.data, v2.length, &back, &parsed_size) == LZFSE_ZAZZCAT_OK && parsed_size == size &&
-              compare_bytes(&back, &h, sizeof h) == 0,
+              equal_bytes(&back, &h, sizeof h),
           "v2 round trip");
     CHECK(write_v1_header(&h, &v1), "write v1");
     CHECK(parse_v1_header(v1.data, v1.length, &back, &parsed_size) == LZFSE_ZAZZCAT_OK &&
-              parsed_size == V1_HEADER_SIZE && compare_bytes(&back, &h, sizeof h) == 0,
+              parsed_size == V1_HEADER_SIZE && equal_bytes(&back, &h, sizeof h),
           "v1 round trip");
     lzfse_zazzcat_buffer_free(&v2);
     lzfse_zazzcat_buffer_free(&v1);
@@ -320,7 +320,7 @@ static size_t lzvn_round_trip(const uint8_t *data, size_t n) {
     CHECK(lzfse_zazzcat_lzvn_encode(data, n, &encoded) == LZFSE_ZAZZCAT_OK, "encode");
     uint8_t *decoded = raw_malloc(n + 1);
     CHECK(lzvn_decode_block(encoded.data, encoded.length, decoded, 0, n) == LZFSE_ZAZZCAT_OK &&
-              (n == 0 || compare_bytes(decoded, data, n) == 0),
+              (n == 0 || equal_bytes(decoded, data, n)),
           "LZVN round trip of %zu bytes", n);
     size_t size = encoded.length;
     raw_free(decoded);
@@ -410,7 +410,7 @@ static void test_copy_match_exact(void) {
             for (int i = 0; i < 100; i++) a[i] = b[i] = (uint8_t)i;
             copy_match_exact(a, 100, d, m);
             for (size_t i = 0; i < m; i++) b[100 + i] = b[100 + i - d];
-            CHECK(compare_bytes(a, b, sizeof a) == 0, "d=%zu m=%zu", d, m);
+            CHECK(equal_bytes(a, b, sizeof a), "d=%zu m=%zu", d, m);
         }
     }
 }
@@ -421,7 +421,7 @@ static void test_wild_copy(void) {
     for (size_t n = 0; n < 90; n++) {
         uint8_t destination[120] = {0};
         wild_copy(destination + 3, source + 5, n);
-        CHECK(compare_bytes(destination + 3, source + 5, n) == 0, "n=%zu", n);
+        CHECK(equal_bytes(destination + 3, source + 5, n), "n=%zu", n);
         // Nothing beyond the 15-byte slack is touched (steps of 16 from the start, the first always runs).
         size_t touched = n == 0 ? 16 : (n + 15) / 16 * 16;
         for (size_t i = 3 + touched; i < 120; i++) CHECK(destination[i] == 0, "n=%zu wrote at %zu", n, i);
@@ -442,8 +442,7 @@ static void test_decode_token_fast_matches_reference(void) {
                 copy_bytes(before, a, sizeof a);
                 bool done = decode_token_fast(a, sizeof a, 60, literals, sizeof literals, 5, l, d, m);
                 if (d < 8 && m > 64) {
-                    CHECK(!done && compare_bytes(a, before, sizeof a) == 0, "d=%zu l=%zu m=%zu should decline", d, l,
-                          m);
+                    CHECK(!done && equal_bytes(a, before, sizeof a), "d=%zu l=%zu m=%zu should decline", d, l, m);
                     continue;
                 }
                 CHECK(done, "d=%zu l=%zu m=%zu", d, l, m);
@@ -451,8 +450,8 @@ static void test_decode_token_fast_matches_reference(void) {
                 copy_bytes(want + 60, literals + 5, l);
                 for (size_t i = 0; i < m; i++) want[60 + l + i] = want[60 + l + i - d];
                 size_t end = 60 + l + m;
-                CHECK(compare_bytes(a, want, end) == 0, "d=%zu l=%zu m=%zu", d, l, m);
-                CHECK(compare_bytes(a + end + 16, before + end + 16, sizeof a - end - 16) == 0,
+                CHECK(equal_bytes(a, want, end), "d=%zu l=%zu m=%zu", d, l, m);
+                CHECK(equal_bytes(a + end + 16, before + end + 16, sizeof a - end - 16),
                       "wrote past the slack: d=%zu l=%zu m=%zu", d, l, m);
             }
         }
@@ -463,7 +462,7 @@ static void test_decode_token_fast_matches_reference(void) {
     CHECK(!decode_token_fast(out, 100, 10, literals, 120, 0, 2, 13, 4), "distance before the start");
     CHECK(!decode_token_fast(out, 100, 60, literals, 120, 0, 2, 5, 10), "output too short");
     CHECK(!decode_token_fast(out, 100, 10, literals, 120, 110, 2, 5, 4), "literals too short");
-    CHECK(compare_bytes(out, zeros, sizeof out) == 0, "nothing written when declining");
+    CHECK(equal_bytes(out, zeros, sizeof out), "nothing written when declining");
 }
 
 // --- Whole streams ---

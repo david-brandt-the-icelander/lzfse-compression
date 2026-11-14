@@ -2,3 +2,6 @@
 /build
 # Local benchmark inputs.
 /corpus
+.clangd
+m?-report.md
+target/

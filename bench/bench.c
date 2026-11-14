@@ -214,12 +214,12 @@ static void contender_init(contender *c, const char *name, contender_kind kind, 
         const uint8_t *data = piece(c, i, &length);
         lzfse_zazzcat_status status = lzfse_zazzcat_decode_into(c->streams[i].data, c->streams[i].length, c->output,
                                                                 c->output_capacity, &written);
-        require(status == LZFSE_ZAZZCAT_OK && written == length && compare_bytes(c->output, data, length) == 0,
-                "our decoder", c, i);
+        require(status == LZFSE_ZAZZCAT_OK && written == length && equal_bytes(c->output, data, length), "our decoder",
+                c, i);
 #ifdef __APPLE__
         written = compression_decode_buffer(c->output, c->output_capacity, c->streams[i].data, c->streams[i].length,
                                             NULL, COMPRESSION_LZFSE);
-        require(written == length && compare_bytes(c->output, data, length) == 0, "Apple's decoder", c, i);
+        require(written == length && equal_bytes(c->output, data, length), "Apple's decoder", c, i);
 #endif
     }
 }

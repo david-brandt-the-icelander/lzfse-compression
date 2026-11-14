@@ -59,7 +59,9 @@ lzfse_zazzcat_status lzfse_zazzcat_decmpfs_compress(const void *data, size_t len
 lzfse_zazzcat_status lzfse_zazzcat_decmpfs_parse_header(const void *xattr_bytes, size_t xattr_length, uint32_t *type,
                                                         uint64_t *uncompressed_size) {
     const uint8_t *xattr = xattr_bytes;
-    if (xattr_length < DECMPFS_HEADER_SIZE || compare_bytes(xattr, decmpfs_magic, 4) != 0) return LZFSE_ZAZZCAT_CORRUPT;
+    // Compare the 4 magic bytes as one 32-bit integer: a single unaligned load and one compare against a
+    // constant (load_u32 of the static const magic folds to an immediate).
+    if (xattr_length < DECMPFS_HEADER_SIZE || load_u32(xattr) != load_u32(decmpfs_magic)) return LZFSE_ZAZZCAT_CORRUPT;
     *type = load_u32(xattr + 4);
     *uncompressed_size = load_u64(xattr + 8);
     return LZFSE_ZAZZCAT_OK;

@@ -4,6 +4,7 @@
 #ifndef LZFSE_ZAZZCAT_MEMORY_OPERATIONS_H
 #define LZFSE_ZAZZCAT_MEMORY_OPERATIONS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -30,7 +31,15 @@ static inline void clear_bytes(void *destination, size_t count) {
 
 // Compare `count` bytes; returns 0 when equal, otherwise the sign of the first difference.
 static inline int compare_bytes(const void *a, const void *b, size_t count) {
+    // not used in the real code, just tests, tools, benchmarks
     return memcmp(a, b, count);
+}
+
+// True when the first `count` bytes of `a` and `b` are the same. Use this for equality checks and keep
+// compare_bytes for callers that need the order.
+static inline bool equal_bytes(const void *a, const void *b, size_t count) {
+    // not used in the real code, just tests, tools, benchmarks
+    return compare_bytes(a, b, count) == 0;
 }
 
 #endif
