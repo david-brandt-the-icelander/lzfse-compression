@@ -415,11 +415,16 @@ static void describe_allocator(char *out, size_t size) {
     int (*mimalloc_version)(void) = (int (*)(void))dlsym(process, "mi_version");
     bool (*in_mimalloc_heap)(const void *) = (bool (*)(const void *))dlsym(process, "mi_is_in_heap_region");
     if (mimalloc_version != NULL && in_mimalloc_heap != NULL) {
+        // mi_version() packs the version into one number: 212 for 2.1.2 in mimalloc 2, and two digits each for the
+        // minor and patch numbers in newer releases (30601 for 3.6.1).
         int version = mimalloc_version();
+        int major = version >= 10000 ? version / 10000 : version / 100;
+        int minor = version >= 10000 ? version / 100 % 100 : version / 10 % 10;
+        int patch = version >= 10000 ? version % 100 : version % 10;
         void *probe = raw_malloc(64);
         bool replaces_malloc = in_mimalloc_heap(probe);
         raw_free(probe);
-        snprintf(out, size, "mimalloc %d.%d.%d (%s)", version / 100, version / 10 % 10, version % 10,
+        snprintf(out, size, "mimalloc %d.%d.%d (mi_version %d; %s)", major, minor, patch, version,
                  replaces_malloc ? "replaces malloc for the whole process"
                                  : "loaded, but malloc is still the system's");
     }
