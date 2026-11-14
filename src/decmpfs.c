@@ -10,8 +10,7 @@ static const uint8_t decmpfs_magic[4] = {'f', 'p', 'm', 'c'};
 static void push_header(lzfse_zazzcat_buffer *xattr, uint32_t type, uint64_t size) {
     buffer_append_reserved(xattr, decmpfs_magic, 4);
     buffer_push_u32_reserved(xattr, type);
-    store_u64(xattr->data + xattr->length, size);
-    xattr->length += 8;
+    buffer_push_u64_reserved(xattr, size);
 }
 
 void lzfse_zazzcat_decmpfs_free(lzfse_zazzcat_decmpfs *compressed) {

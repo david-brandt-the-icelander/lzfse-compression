@@ -152,8 +152,7 @@ void block_writer_flush(block_writer *blocks, const uint8_t *source, lzfse_zazzc
             // Not smaller than storing the bytes as they are: replace the block with a raw one.
             output->length = mark;
             if (buffer_reserve(output, blocks->covered_bytes + UNCOMPRESSED_HEADER_SIZE)) {
-                buffer_push_u32_reserved(output, MAGIC_UNCOMPRESSED);
-                buffer_push_u32_reserved(output, (uint32_t)blocks->covered_bytes);
+                buffer_push_u32_x2_reserved(output, MAGIC_UNCOMPRESSED, (uint32_t)blocks->covered_bytes);
                 buffer_append_reserved(output, source + blocks->block_start, blocks->covered_bytes);
             } else {
                 blocks->status = LZFSE_ZAZZCAT_OUT_OF_MEMORY;
