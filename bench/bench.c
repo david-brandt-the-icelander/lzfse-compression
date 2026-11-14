@@ -6,8 +6,9 @@
 // Every encoded output is decoded back (and on macOS also by Apple's decoder) before its timing counts. With
 // --stats it prints, instead of timings, what each encoder chose: token counts and distributions read from the
 // compressed streams. That output holds only aggregate numbers, never the input's content.
-#define _DEFAULT_SOURCE // Linux: popen and clock_gettime in <stdio.h>/<time.h> under -std=c11
 #define _DARWIN_C_SOURCE
+// The benchmark starts its own decoding threads, also when the library is built without threads.
+#define LZFSE_ZAZZCAT_PROGRAM_USES_THREADS
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
