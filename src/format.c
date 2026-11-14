@@ -120,34 +120,33 @@ uint16_t read_frequency(uint32_t bits, uint32_t *bit_count) {
     return (uint16_t)(4 + ((bits >> 3) & 3));
 }
 
-uint32_t write_frequency(uint16_t value, uint32_t *bit_count) {
-    uint32_t v = value;
-    if (v == 0) {
+uint32_t write_frequency(uint32_t value, uint32_t *bit_count) {
+    if (value == 0) {
         *bit_count = 2;
         return 0;
     }
-    if (v == 1) {
+    if (value == 1) {
         *bit_count = 2;
         return 2;
     }
-    if (v == 2) {
+    if (value == 2) {
         *bit_count = 3;
         return 1;
     }
-    if (v == 3) {
+    if (value == 3) {
         *bit_count = 3;
         return 5;
     }
-    if (v <= 7) {
+    if (value <= 7) {
         *bit_count = 5;
-        return 3 | ((v - 4) << 3);
+        return 3 | ((value - 4) << 3);
     }
-    if (v <= 23) {
+    if (value <= 23) {
         *bit_count = 8;
-        return 7 | ((v - 8) << 4);
+        return 7 | ((value - 8) << 4);
     }
     *bit_count = 14;
-    return 15 | ((v - 24) << 4);
+    return 15 | ((value - 24) << 4);
 }
 
 lzfse_zazzcat_status parse_v2_header(const uint8_t *source, size_t source_length, block_header *h,
@@ -250,7 +249,8 @@ void write_v2_fixed_fields(const block_header *h, uint32_t header_size, uint8_t 
 bool write_v1_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     if (!buffer_reserve(output, V1_HEADER_SIZE)) return false;
     uint8_t *out = output->data + output->length;
-    clear_bytes(out, V1_HEADER_SIZE);
+    // Not cleared: the stores below write bytes 0 to 769, and the 2 padding bytes at the end are zeroed last.
+    // clear_bytes(out, V1_HEADER_SIZE);
     uint32_t fields[8] = {MAGIC_LZFSE_V1,
                           h->decoded_size,
                           h->literal_payload_size + h->token_payload_size,
@@ -268,6 +268,8 @@ bool write_v1_header(const block_header *h, lzfse_zazzcat_buffer *output) {
     for (int t = 0; t < 4; t++) {
         for (size_t i = 0; i < tables.count[t]; i++, offset += 2) store_u16(out + offset, tables.table[t][i]);
     }
+    // The header struct's trailing padding (offset 770 here) rounds its size up to a multiple of 4.
+    store_u16(out + offset, 0);
     output->length += V1_HEADER_SIZE;
     return true;
 }
