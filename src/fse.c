@@ -9,17 +9,35 @@ static uint32_t shift_for(uint32_t frequency, uint32_t state_count) {
     return (uint32_t)(__builtin_clz(frequency) - __builtin_clz(state_count));
 }
 
-// One used symbol's leftover share, for distributing the states that rounding down left over.
-typedef struct remainder_entry {
-    uint64_t remainder;
-    size_t symbol;
-} remainder_entry;
-
-// qsort comparison: larger remainders first, then lower symbols first (so the result is deterministic).
-static int compare_remainders(const void *a, const void *b) {
-    const remainder_entry *x = a, *y = b;
-    if (x->remainder != y->remainder) return x->remainder > y->remainder ? -1 : 1;
-    return x->symbol < y->symbol ? -1 : (x->symbol > y->symbol);
+// Reorder `keys[0 .. count)` so that its `wanted` largest keys come first (0 < wanted < count), in any order.
+// The keys are distinct. This is quickselect: like quicksort, it splits the range around a pivot (larger keys to
+// the left), but then continues only in the part that contains position `wanted`, so it takes linear time.
+static void select_largest(uint64_t *keys, size_t count, size_t wanted) {
+    size_t low = 0, high = count - 1;
+    while (low < high) {
+        uint64_t pivot = keys[low + (high - low) / 2];
+        size_t i = low, j = high;
+        // Hoare partition, largest first: keys[low .. i) >= pivot >= keys(j .. high].
+        while (i <= j) {
+            while (keys[i] > pivot) i++;
+            while (keys[j] < pivot) j--;
+            if (i <= j) {
+                uint64_t swap = keys[i];
+                keys[i] = keys[j];
+                keys[j] = swap;
+                i++;
+                if (j == 0) break;
+                j--;
+            }
+        }
+        if (wanted <= j) {
+            high = j;
+        } else if (wanted >= i) {
+            low = i;
+        } else {
+            return;
+        }
+    }
 }
 
 void fse_normalize(const uint32_t *counts, size_t symbol_count, uint32_t state_count, uint16_t *frequencies) {
@@ -34,7 +52,10 @@ void fse_normalize(const uint32_t *counts, size_t symbol_count, uint32_t state_c
     }
     // Largest-remainder rounding: give every used symbol the floor of its share (at least 1), then hand the
     // leftover states to the largest remainders.
-    remainder_entry remainders[256];
+    // Each used symbol's leftover share and the symbol, packed into one key: remainder << 8 | (255 - symbol).
+    // The remainder is below `total` (at most 256 counts of 32 bits, so below 2^40), so the key fits 48 bits.
+    // A larger key means a larger remainder, then a lower symbol, so plain integer order is the order wanted.
+    uint64_t keys[256];
     size_t used = 0;
     uint32_t assigned = 0;
     for (size_t i = 0; i < symbol_count; i++) {
@@ -47,15 +68,19 @@ void fse_normalize(const uint32_t *counts, size_t symbol_count, uint32_t state_c
         if (share < 1) share = 1;
         frequencies[i] = (uint16_t)share;
         assigned += share;
-        remainders[used].remainder = scaled % total;
-        remainders[used].symbol = i;
-        used++;
+        keys[used++] = (scaled % total) << 8 | (255 - i);
     }
     if (assigned < state_count) {
-        qsort(remainders, used, sizeof remainders[0], compare_remainders);
+        // Every used symbol rounded down by less than 1, so fewer than `used` states are left: they go to the
+        // `left` largest keys, one each.
         uint32_t left = state_count - assigned;
-        while (left > 0) {
-            for (size_t r = 0; r < used && left > 0; r++, left--) frequencies[remainders[r].symbol]++;
+        while (left >= used) {
+            for (size_t r = 0; r < used; r++) frequencies[255 - (keys[r] & 0xFF)]++;
+            left -= (uint32_t)used;
+        }
+        if (left > 0) {
+            select_largest(keys, used, left);
+            for (size_t r = 0; r < left; r++) frequencies[255 - (keys[r] & 0xFF)]++;
         }
     }
     // Rounding small symbols up to 1 can overshoot; take the excess from the largest frequencies.
