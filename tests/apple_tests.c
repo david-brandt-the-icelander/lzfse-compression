@@ -370,8 +370,9 @@ static void test_kernel_reads_our_files(void) {
     free_corpus(samples, count);
 }
 
-// lzfse_zazzcat_decmpfs_apply on a file opened read-only fails at its first write, says which step, and leaves the
-// file's contents as they were.
+// lzfse_zazzcat_decmpfs_apply on a file opened read-only fails, says which step, and leaves the file's contents as
+// they were. Which step fails is up to the kernel: macOS checks extended-attribute writes against the file's
+// permissions rather than the descriptor's mode, so the attributes may be set before emptying the data fails.
 static void test_apply_reports_the_failing_step(void) {
     char path[256];
     snprintf(path, sizeof path, "/tmp/lzfse-zazzcat-readonly-%d", (int)getpid());
@@ -385,8 +386,8 @@ static void test_apply_reports_the_failing_step(void) {
     REQUIRE(fd >= 0, "open %s: %s", path, strerror(errno));
     const char *step = NULL;
     CHECK(lzfse_zazzcat_decmpfs_apply(fd, &c, &step) == LZFSE_ZAZZCAT_SYSTEM_ERROR, "apply on a read-only descriptor");
-    CHECK(step != NULL && strcmp(step, "setting com.apple.ResourceFork") == 0, "failed step: %s",
-          step != NULL ? step : "(none)");
+    CHECK(step != NULL && step[0] != 0, "a failed step is named");
+    bare_printf("    read-only descriptor: failed at %s\n", step != NULL ? step : "(none)");
     bare_close(fd);
     CHECK(read_file(path, &back) == 0 && same_bytes(back.data, back.length, data.data, data.length),
           "the file is unchanged");
