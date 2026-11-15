@@ -267,8 +267,12 @@ static int read_xattr(const char *path, const char *name, lzfse_zazzcat_buffer *
     return 0;
 }
 
+// One path, in a fixed-size buffer. A named type keeps declarations of pointers to these buffers free of the
+// `char (*name)[512]` syntax, which clang-format versions space differently.
+typedef char path_buffer[512];
+
 // Collect up to `max` compressed regular files under `directory` (not following links) into `paths`.
-static void find_compressed_files(const char *directory, size_t max, char (*paths)[512], size_t *count) {
+static void find_compressed_files(const char *directory, size_t max, path_buffer *paths, size_t *count) {
     DIR *dir = opendir(directory);
     if (dir == NULL) return;
     struct dirent *entry;
@@ -281,7 +285,7 @@ static void find_compressed_files(const char *directory, size_t max, char (*path
         if (S_ISDIR(info.st_mode)) {
             find_compressed_files(path, max, paths, count);
         } else if (S_ISREG(info.st_mode) && (info.st_flags & UF_COMPRESSED)) {
-            snprintf(paths[(*count)++], 512, "%s", path);
+            snprintf(paths[(*count)++], sizeof(path_buffer), "%s", path);
         }
     }
     bare_closedir(dir);
@@ -290,7 +294,7 @@ static void find_compressed_files(const char *directory, size_t max, char (*path
 // Files macOS itself compressed decode with our decmpfs parser to the same bytes the kernel returns.
 static void test_system_compressed_files(void) {
     size_t max = 16000, count = 0;
-    char (*paths)[512] = raw_malloc(max * 512);
+    path_buffer *paths = raw_malloc(max * sizeof(path_buffer));
     const char *directories[] = {"/usr/bin", "/usr/libexec", "/System/Library/CoreServices",
                                  "/System/Library/Frameworks"};
     for (int i = 0; i < 4; i++) find_compressed_files(directories[i], count + 4000, paths, &count);
