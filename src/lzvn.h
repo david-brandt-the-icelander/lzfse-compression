@@ -16,6 +16,12 @@ typedef struct lzvn_hash_table {
     size_t capacity;
 } lzvn_hash_table;
 
+// Room the LZVN encoder reserves for an `source_length`-byte input: every input byte costs at most 2 output bytes
+// (a literal plus its share of an opcode), plus the trailer.
+static inline size_t lzvn_encode_bound(size_t source_length) {
+    return 2 * source_length + 64;
+}
+
 // Append `source` compressed as an LZVN payload (ending with the end-of-stream opcode) to `output`, using
 // `table` for the match finder.
 lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t source_length, lzfse_zazzcat_buffer *output,

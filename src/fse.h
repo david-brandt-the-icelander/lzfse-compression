@@ -14,28 +14,30 @@
 // symbol at least 1.
 void fse_normalize(const uint32_t *counts, size_t symbol_count, uint32_t state_count, uint16_t *frequencies);
 
-// How to encode one symbol from any state.
+// How to encode one symbol, in two numbers instead of a threshold, a bit count and two deltas (the trick zstd's FSE
+// encoder uses). The encoder keeps its state offset by the table size, as x = state + state_count in
+// [state_count, 2 * state_count). With N = state_count and the symbol's k and frequency f (see the top of this
+// file), states x >= f * 2^k write k bits and smaller ones k - 1. `bits_delta` is (k << 16) - f * 2^k, so
+// x + bits_delta is k * 65536 plus a value in (-N, N): shifting right by 16 gives k when x >= f * 2^k and k - 1
+// otherwise, with no compare. And because each symbol owns one contiguous range of states, the next x is
+// (x >> bits) + state_delta in both cases, with state_delta = offset + N - f.
 typedef struct fse_encoder_entry {
-    // States at or above `threshold` write `bits` bits; smaller states write `bits - 1`.
-    uint32_t threshold;
-    uint32_t bits;
-    // Added to the state's remaining high bits to give the next state (may be negative).
-    int32_t delta_high;
-    int32_t delta_low;
+    int32_t bits_delta;
+    int32_t state_delta;
 } fse_encoder_entry;
 
 // Build the encoder entries for `symbol_count` frequencies that sum to `state_count`.
 void fse_encoder_table(const uint16_t *frequencies, size_t symbol_count, uint32_t state_count,
                        fse_encoder_entry *table);
 
-// Encode a symbol: write the low bits of `*state` and move to the symbol's state.
+// Encode a symbol: write the low bits of `*state` (an x as above, so it starts at state_count and the decoder's
+// starting state is the final x minus state_count) and move to the symbol's state. The low bits of x and of the
+// state are the same, since state_count is a multiple of 2^bits.
 ALWAYS_INLINE void fse_encode(uint32_t *state, const fse_encoder_entry *entry, bit_writer *writer) {
-    uint32_t s = *state;
-    bool high = s >= entry->threshold;
-    uint32_t bits = high ? entry->bits : entry->bits - 1;
-    int32_t delta = high ? entry->delta_high : entry->delta_low;
-    bit_writer_push(writer, bits, s & ((1u << bits) - 1));
-    *state = (uint32_t)(delta + (int32_t)(s >> bits));
+    uint32_t x = *state;
+    uint32_t bits = (x + (uint32_t)entry->bits_delta) >> 16;
+    bit_writer_push(writer, bits, x & ((1u << bits) - 1));
+    *state = (x >> bits) + (uint32_t)entry->state_delta;
 }
 
 // Decoder entry for one literal state: bits to read, the symbol, and the base of the next state.

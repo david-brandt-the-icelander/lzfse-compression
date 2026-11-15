@@ -28,6 +28,25 @@ void block_writer_free(block_writer *blocks) {
     blocks->literals = NULL;
 }
 
+// Count how often each byte value occurs in `literals[0 .. count)` (`count` a multiple of 4) into `counts`.
+// Each step loads 4 literals at once, and each of the 4 byte lanes has its own table of counts. With one table, a
+// run of equal bytes makes every step wait for the previous step's store to the same counter; with four, the lanes
+// update different counters and the steps overlap. The tables are added together at the end.
+static void count_literals(const uint8_t *literals, size_t count, uint32_t counts[LITERAL_SYMBOLS]) {
+    uint32_t lane_counts[4][LITERAL_SYMBOLS];
+    clear_bytes(lane_counts, sizeof lane_counts);
+    for (size_t i = 0; i < count; i += 4) {
+        uint32_t four = load_u32(literals + i);
+        lane_counts[0][four & 0xFF]++;
+        lane_counts[1][(four >> 8) & 0xFF]++;
+        lane_counts[2][(four >> 16) & 0xFF]++;
+        lane_counts[3][four >> 24]++;
+    }
+    for (size_t s = 0; s < LITERAL_SYMBOLS; s++) {
+        counts[s] = lane_counts[0][s] + lane_counts[1][s] + lane_counts[2][s] + lane_counts[3][s];
+    }
+}
+
 // Entropy-code the buffered tokens and literals as a `bvx2` block appended to `output`.
 static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buffer *output) {
     // The literal stream encodes 4 literals per step, so pad the literals with zeros to a multiple of 4.
@@ -69,8 +88,8 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     header.literal_length_state = 0;
     header.match_length_state = 0;
     header.distance_state = 0;
-    uint32_t literal_counts[LITERAL_SYMBOLS] = {0};
-    for (size_t i = 0; i < literal_count; i++) literal_counts[literals[i]]++;
+    uint32_t literal_counts[LITERAL_SYMBOLS];
+    count_literals(literals, literal_count, literal_counts);
     uint32_t literal_length_counts[LITERAL_LENGTH_SYMBOLS] = {0};
     uint32_t match_length_counts[MATCH_LENGTH_SYMBOLS] = {0};
     uint32_t distance_counts[DISTANCE_SYMBOLS] = {0};
@@ -109,18 +128,20 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
 
     // Literals: four interleaved states, encoded last group first so the decoder reads them forwards.
     size_t literal_stream_start = output->length;
-    bit_writer writer = {0, 0};
-    uint32_t states[4] = {0, 0, 0, 0};
+    bit_writer writer;
+    bit_writer_start(&writer, output);
+    // fse_encode keeps each state offset by the table size; the header gets the states without the offset.
+    uint32_t states[4] = {LITERAL_STATES, LITERAL_STATES, LITERAL_STATES, LITERAL_STATES};
     for (size_t group = literal_count; group > 0; group -= 4) {
         const uint8_t *four = literals + group - 4;
         fse_encode(&states[3], &literal_encoder[four[3]], &writer);
         fse_encode(&states[2], &literal_encoder[four[2]], &writer);
         fse_encode(&states[1], &literal_encoder[four[1]], &writer);
         fse_encode(&states[0], &literal_encoder[four[0]], &writer);
-        bit_writer_flush(&writer, output);
+        bit_writer_flush(&writer);
     }
     header.literal_padding_bits = bit_writer_finish(&writer, output);
-    for (int i = 0; i < 4; i++) header.literal_states[i] = (uint16_t)states[i];
+    for (int i = 0; i < 4; i++) header.literal_states[i] = (uint16_t)(states[i] - LITERAL_STATES);
     header.literal_payload_size = (uint32_t)(output->length - literal_stream_start);
 
     // Tokens: 8 zero bytes first, then each token (last first) as distance, match length and literal length,
@@ -128,8 +149,10 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     size_t token_stream_start = output->length;
     clear_bytes(output->data + output->length, 8);
     output->length += 8;
-    writer = (bit_writer){0, 0};
-    uint32_t literal_length_state = 0, match_length_state = 0, distance_state = 0;
+    bit_writer_start(&writer, output);
+    // Offset by the table sizes, as the literal states are.
+    uint32_t literal_length_state = LITERAL_LENGTH_STATES, match_length_state = MATCH_LENGTH_STATES;
+    uint32_t distance_state = DISTANCE_STATES;
     for (size_t t = token_count; t > 0; t--) {
         const token *tk = &tokens[t - 1];
         uint32_t l = tk->symbols[0], m = tk->symbols[1], d = tk->symbols[2];
@@ -139,12 +162,12 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
         fse_encode(&match_length_state, &match_length_encoder[m], &writer);
         bit_writer_push(&writer, literal_length_extra_bits[l], tk->literal_length - literal_length_base[l]);
         fse_encode(&literal_length_state, &literal_length_encoder[l], &writer);
-        bit_writer_flush(&writer, output);
+        bit_writer_flush(&writer);
     }
     header.token_padding_bits = bit_writer_finish(&writer, output);
-    header.literal_length_state = (uint16_t)literal_length_state;
-    header.match_length_state = (uint16_t)match_length_state;
-    header.distance_state = (uint16_t)distance_state;
+    header.literal_length_state = (uint16_t)(literal_length_state - LITERAL_LENGTH_STATES);
+    header.match_length_state = (uint16_t)(match_length_state - MATCH_LENGTH_STATES);
+    header.distance_state = (uint16_t)(distance_state - DISTANCE_STATES);
     header.token_payload_size = (uint32_t)(output->length - token_stream_start);
     // Only the fixed fields change (final states and stream sizes); the frequency tables written above stay.
     write_v2_fixed_fields(&header, (uint32_t)header_size, output->data + header_start);
