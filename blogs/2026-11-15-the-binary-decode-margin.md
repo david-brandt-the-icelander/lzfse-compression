@@ -131,3 +131,11 @@ quoted. The M1 benchmark will say how much of this shows up in MB/s.
   and, here, registers too.
 - **Judge an optimization on the target's assembly.** Precomputed masks cut 6–14% of x86 instructions and nothing on
   arm64, because wider data costs registers that the M1 code was already short of.
+
+## Update: the M1 result
+
+The owner's M1 Pro run of `main` with this change ([report](../docs/benchmarks/2026-11-15-owner-m1-pro-main.md))
+had Apple's own speeds within about 1% of the previous evening's run, so the two compare directly. Single-threaded
+decoding rose by about what the instruction counts predicted: text +8–10%, binaries +5–7%, JSON +4–5%. Binary
+decoding is now 9–15% ahead of Apple's (it was 1–5% behind two runs earlier), clear of the run-to-run noise that
+made the margin uncertain.
