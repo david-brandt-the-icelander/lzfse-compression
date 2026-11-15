@@ -80,10 +80,6 @@ ALWAYS_INLINE void wild_copy(uint8_t *destination, const uint8_t *source, size_t
     }
 }
 
-// Largest literal or match length a decoded token can carry (above MAX_MATCH_LENGTH), so sums of positions in
-// decode_token_fast cannot overflow.
-#define MAX_TOKEN_PART (1u << 16)
-
 // Execute one decoded token in the decoder's hot loop: copy `literal_length` literals from
 // `literals + literal_position`, then `match_length` bytes from `distance` back, to `output + position`.
 // One combined check stands for all the copies' bounds and the body makes no function calls, so the decoder's
@@ -93,6 +89,10 @@ ALWAYS_INLINE void wild_copy(uint8_t *destination, const uint8_t *source, size_t
 //
 // `restrict` promises the compiler that the output and the literals do not overlap, so it need not reload one
 // after writing the other. `literals_capacity` is how far the literals may be read (16 past each token's literals).
+//
+// Callers pass small lengths, which keeps the sums below from overflowing without a check: the format's constant
+// tables cap an LZFSE literal length at 315 and a match length at 2359 (whatever a corrupt stream holds), and an
+// LZVN opcode carries at most 271 of either.
 ALWAYS_INLINE bool decode_token_fast(uint8_t *restrict output, size_t output_capacity, size_t position,
                                      const uint8_t *restrict literals, size_t literals_capacity,
                                      size_t literal_position, size_t literal_length, size_t distance,
@@ -100,8 +100,7 @@ ALWAYS_INLINE bool decode_token_fast(uint8_t *restrict output, size_t output_cap
     size_t match_start = position + literal_length;
     // `distance - 1 < match_start` checks 1 <= distance <= match_start in one comparison: for distance 0 the
     // unsigned subtraction wraps around to the largest value.
-    bool ok = literal_length <= MAX_TOKEN_PART && match_length <= MAX_TOKEN_PART &&
-              match_start + match_length + COPY_SLACK <= output_capacity &&
+    bool ok = match_start + match_length + COPY_SLACK <= output_capacity &&
               literal_position + literal_length + 16 <= literals_capacity && distance - 1 < match_start &&
               (distance >= 8 || match_length <= 64);
     if (!ok) return false;
