@@ -130,7 +130,8 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     size_t literal_stream_start = output->length;
     bit_writer writer;
     bit_writer_start(&writer, output);
-    uint32_t states[4] = {0, 0, 0, 0};
+    // fse_encode keeps each state offset by the table size; the header gets the states without the offset.
+    uint32_t states[4] = {LITERAL_STATES, LITERAL_STATES, LITERAL_STATES, LITERAL_STATES};
     for (size_t group = literal_count; group > 0; group -= 4) {
         const uint8_t *four = literals + group - 4;
         fse_encode(&states[3], &literal_encoder[four[3]], &writer);
@@ -140,7 +141,7 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
         bit_writer_flush(&writer);
     }
     header.literal_padding_bits = bit_writer_finish(&writer, output);
-    for (int i = 0; i < 4; i++) header.literal_states[i] = (uint16_t)states[i];
+    for (int i = 0; i < 4; i++) header.literal_states[i] = (uint16_t)(states[i] - LITERAL_STATES);
     header.literal_payload_size = (uint32_t)(output->length - literal_stream_start);
 
     // Tokens: 8 zero bytes first, then each token (last first) as distance, match length and literal length,
@@ -149,7 +150,9 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
     clear_bytes(output->data + output->length, 8);
     output->length += 8;
     bit_writer_start(&writer, output);
-    uint32_t literal_length_state = 0, match_length_state = 0, distance_state = 0;
+    // Offset by the table sizes, as the literal states are.
+    uint32_t literal_length_state = LITERAL_LENGTH_STATES, match_length_state = MATCH_LENGTH_STATES;
+    uint32_t distance_state = DISTANCE_STATES;
     for (size_t t = token_count; t > 0; t--) {
         const token *tk = &tokens[t - 1];
         uint32_t l = tk->symbols[0], m = tk->symbols[1], d = tk->symbols[2];
@@ -162,9 +165,9 @@ static lzfse_zazzcat_status encode_block(block_writer *blocks, lzfse_zazzcat_buf
         bit_writer_flush(&writer);
     }
     header.token_padding_bits = bit_writer_finish(&writer, output);
-    header.literal_length_state = (uint16_t)literal_length_state;
-    header.match_length_state = (uint16_t)match_length_state;
-    header.distance_state = (uint16_t)distance_state;
+    header.literal_length_state = (uint16_t)(literal_length_state - LITERAL_LENGTH_STATES);
+    header.match_length_state = (uint16_t)(match_length_state - MATCH_LENGTH_STATES);
+    header.distance_state = (uint16_t)(distance_state - DISTANCE_STATES);
     header.token_payload_size = (uint32_t)(output->length - token_stream_start);
     // Only the fixed fields change (final states and stream sizes); the frequency tables written above stay.
     write_v2_fixed_fields(&header, (uint32_t)header_size, output->data + header_start);

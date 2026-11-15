@@ -24,13 +24,11 @@ ALWAYS_INLINE void bit_writer_start(bit_writer *writer, lzfse_zazzcat_buffer *ou
     writer->next = output->data + output->length;
 }
 
-// Append the low `count` bits of `value` (`value` must have no higher bits set). The caller flushes before 64
-// bits accumulate.
+// Append the low `count` bits of `value` (`value` must have no higher bits set, so it is 0 when `count` is 0).
+// The caller flushes before 64 bits accumulate, so the shift is always below 64.
 ALWAYS_INLINE void bit_writer_push(bit_writer *writer, uint32_t count, uint64_t value) {
-    if (count != 0) {
-        writer->accumulator |= value << writer->bit_count;
-        writer->bit_count += count;
-    }
+    writer->accumulator |= value << writer->bit_count;
+    writer->bit_count += count;
 }
 
 // Move the whole bytes of the accumulator to the output, leaving at most 7 bits. At least 8 bytes must be reserved

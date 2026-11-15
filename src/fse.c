@@ -86,12 +86,9 @@ void fse_encoder_table(const uint16_t *frequencies, size_t symbol_count, uint32_
             continue;
         }
         uint32_t k = shift_for(f, state_count);
-        // States x >= threshold read k bits when decoded; smaller ones read k - 1 (only possible when k >= 1).
-        table[s].threshold = (f << k) - state_count;
-        table[s].bits = k;
-        // The deltas can be negative; adding a state's remaining high bits always lands in [offset, offset + f).
-        table[s].delta_high = (int32_t)(offset + (state_count >> k)) - (int32_t)f;
-        table[s].delta_low = k == 0 ? table[s].delta_high : (int32_t)(offset + (state_count >> (k - 1))) - (int32_t)f;
+        // See fse_encoder_entry in fse.h. Both values fit easily: k <= 10 and f * 2^k < 2 * state_count.
+        table[s].bits_delta = (int32_t)(k << 16) - (int32_t)(f << k);
+        table[s].state_delta = (int32_t)(offset + state_count) - (int32_t)f;
         offset += f;
     }
 }

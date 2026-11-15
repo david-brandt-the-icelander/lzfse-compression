@@ -263,11 +263,13 @@ static void test_fse_literals_round_trip(void) {
         out.length = 8;
         bit_writer writer;
         bit_writer_start(&writer, &out);
-        uint32_t state = 0;
+        // The encoder's state runs in [n, 2n); the decoder's state is that minus n.
+        uint32_t state = n;
         for (int i = 4999; i >= 0; i--) {
             fse_encode(&state, &encoder[data[i]], &writer);
             bit_writer_flush(&writer);
         }
+        state -= n;
         int32_t padding = bit_writer_finish(&writer, &out);
         // Pad the frequencies to a full literal table so the literal decoder can read them.
         uint16_t literal_frequencies[256] = {0};
@@ -374,7 +376,7 @@ static void test_single_symbol_uses_no_bits(void) {
     bare_buffer_reserve(&out, 64);
     bit_writer writer;
     bit_writer_start(&writer, &out);
-    uint32_t state = 0;
+    uint32_t state = 64;
     for (int i = 0; i < 100; i++) fse_encode(&state, &encoder[2], &writer);
     CHECK(bit_writer_finish(&writer, &out) == 0 && out.length == 0, "no bits written");
     lzfse_zazzcat_buffer_free(&out);
