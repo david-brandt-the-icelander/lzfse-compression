@@ -1,4 +1,6 @@
 // APFS/HFS+ transparent compression containers (decmpfs) for LZFSE (types 11 and 12) and LZVN (types 7 and 8).
+// macOS: fchflags, st_flags, UF_COMPRESSED and the extended-attribute calls, used by lzfse_zazzcat_decmpfs_apply.
+#define _DARWIN_C_SOURCE
 #include "buffer.h"
 #include "format.h"
 #include "lzvn.h"
@@ -132,3 +134,61 @@ lzfse_zazzcat_status lzfse_zazzcat_decmpfs_decompress(const void *xattr_bytes, s
     output->length += size;
     return LZFSE_ZAZZCAT_OK;
 }
+
+#ifdef __APPLE__
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+
+// Record which step of lzfse_zazzcat_decmpfs_apply failed, for callers that asked.
+static lzfse_zazzcat_status apply_failed(const char **failed_step, const char *step, lzfse_zazzcat_status status) {
+    if (failed_step != NULL) *failed_step = step;
+    return status;
+}
+
+lzfse_zazzcat_status lzfse_zazzcat_decmpfs_apply(int fd, const lzfse_zazzcat_decmpfs *compressed,
+                                                 const char **failed_step) {
+    uint32_t type;
+    uint64_t size;
+    lzfse_zazzcat_status status =
+        lzfse_zazzcat_decmpfs_parse_header(compressed->xattr.data, compressed->xattr.length, &type, &size);
+    if (status != LZFSE_ZAZZCAT_OK) return apply_failed(failed_step, "reading the decmpfs header", status);
+    // Calls on an open descriptor never follow links, so no XATTR_NOFOLLOW: the f* calls reject it (EINVAL).
+    if (compressed->fork.length > 0) {
+        if (fsetxattr(fd, "com.apple.ResourceFork", compressed->fork.data, compressed->fork.length, 0, 0) != 0) {
+            return apply_failed(failed_step, "setting com.apple.ResourceFork", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+        }
+    } else if (fremovexattr(fd, "com.apple.ResourceFork", 0) != 0 && errno != ENOATTR) {
+        // An inline file must not keep an old resource fork the kernel might read instead.
+        return apply_failed(failed_step, "removing an old com.apple.ResourceFork", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+    }
+    if (fsetxattr(fd, "com.apple.decmpfs", compressed->xattr.data, compressed->xattr.length, 0, 0) != 0) {
+        return apply_failed(failed_step, "setting com.apple.decmpfs", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+    }
+    // A compressed file's data fork is empty: the kernel serves its contents from the attributes.
+    if (ftruncate(fd, 0) != 0) return apply_failed(failed_step, "emptying the data fork", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+    struct stat info;
+    if (fstat(fd, &info) != 0) return apply_failed(failed_step, "reading the file flags", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+    if (fchflags(fd, info.st_flags | UF_COMPRESSED) != 0) {
+        return apply_failed(failed_step, "setting the compressed flag", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+    }
+    // The kernel can accept the flag and still not treat the file as compressed (an unknown type, for example).
+    if (fstat(fd, &info) != 0) return apply_failed(failed_step, "checking the result", LZFSE_ZAZZCAT_SYSTEM_ERROR);
+    if (!(info.st_flags & UF_COMPRESSED) || (uint64_t)info.st_size != size) {
+        return apply_failed(failed_step, "checking the result", LZFSE_ZAZZCAT_NOT_APPLIED);
+    }
+    return LZFSE_ZAZZCAT_OK;
+}
+
+#else
+
+lzfse_zazzcat_status lzfse_zazzcat_decmpfs_apply(int fd, const lzfse_zazzcat_decmpfs *compressed,
+                                                 const char **failed_step) {
+    (void)fd;
+    (void)compressed;
+    if (failed_step != NULL) *failed_step = "decmpfs files exist only on macOS";
+    return LZFSE_ZAZZCAT_UNSUPPORTED;
+}
+
+#endif

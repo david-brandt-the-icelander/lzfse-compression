@@ -15,6 +15,7 @@ void run_apple_tests(void) {}
 #include <compression.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -329,7 +330,8 @@ static void test_system_compressed_files(void) {
     raw_free(paths);
 }
 
-// Files we compress (inline and resource-fork layouts) read back through the kernel unchanged.
+// Files we compress (inline and resource-fork layouts) and apply with lzfse_zazzcat_decmpfs_apply read back through
+// the kernel unchanged. Each file first holds its plain contents, as a file being compressed in place would.
 static void test_kernel_reads_our_files(void) {
     char directory[256];
     snprintf(directory, sizeof directory, "/tmp/lzfse-zazzcat-%d", (int)getpid());
@@ -342,16 +344,16 @@ static void test_kernel_reads_our_files(void) {
         if (d->length == 0) continue;
         char path[512];
         snprintf(path, sizeof path, "%s/sample%zu", directory, i);
-        bare_write_file(path, "", 0);
+        REQUIRE(write_file(path, d->data, d->length) == 0, "write %s", path);
         lzfse_zazzcat_decmpfs c;
         REQUIRE(lzfse_zazzcat_decmpfs_compress(d->data, d->length, &c) == LZFSE_ZAZZCAT_OK, "compress");
-        if (c.fork.length > 0) {
-            CHECK(setxattr(path, "com.apple.ResourceFork", c.fork.data, c.fork.length, 0, 0) == 0, "setxattr fork: %s",
-                  strerror(errno));
-        }
-        CHECK(setxattr(path, "com.apple.decmpfs", c.xattr.data, c.xattr.length, 0, 0) == 0, "setxattr: %s",
-              strerror(errno));
-        CHECK(chflags(path, UF_COMPRESSED) == 0, "chflags: %s", strerror(errno));
+        int fd = open(path, O_RDWR);
+        REQUIRE(fd >= 0, "open %s: %s", path, strerror(errno));
+        const char *step = "none";
+        lzfse_zazzcat_status status = lzfse_zazzcat_decmpfs_apply(fd, &c, &step);
+        CHECK(status == LZFSE_ZAZZCAT_OK, "%s: apply failed at %s: %s (%s)", samples[i].name, step,
+              lzfse_zazzcat_status_string(status), strerror(errno));
+        bare_close(fd);
         struct stat info;
         bare_lstat(path, &info);
         CHECK(info.st_flags & UF_COMPRESSED, "%s: the kernel refused the compressed flag", samples[i].name);
@@ -368,12 +370,40 @@ static void test_kernel_reads_our_files(void) {
     free_corpus(samples, count);
 }
 
+// lzfse_zazzcat_decmpfs_apply on a file opened read-only fails, says which step, and leaves the file's contents as
+// they were. Which step fails is up to the kernel: macOS checks extended-attribute writes against the file's
+// permissions rather than the descriptor's mode, so the attributes may be set before emptying the data fails.
+static void test_apply_reports_the_failing_step(void) {
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/lzfse-zazzcat-readonly-%d", (int)getpid());
+    const char *text = "a file that will not be compressed, because it is open read-only. ";
+    lzfse_zazzcat_buffer data = {0}, back = {0};
+    for (int i = 0; i < 2000; i++) bare_buffer_append(&data, text, strlen(text));
+    REQUIRE(write_file(path, data.data, data.length) == 0, "write %s", path);
+    lzfse_zazzcat_decmpfs c;
+    REQUIRE(lzfse_zazzcat_decmpfs_compress(data.data, data.length, &c) == LZFSE_ZAZZCAT_OK, "compress");
+    int fd = open(path, O_RDONLY);
+    REQUIRE(fd >= 0, "open %s: %s", path, strerror(errno));
+    const char *step = NULL;
+    CHECK(lzfse_zazzcat_decmpfs_apply(fd, &c, &step) == LZFSE_ZAZZCAT_SYSTEM_ERROR, "apply on a read-only descriptor");
+    CHECK(step != NULL && step[0] != 0, "a failed step is named");
+    bare_printf("    read-only descriptor: failed at %s\n", step != NULL ? step : "(none)");
+    bare_close(fd);
+    CHECK(read_file(path, &back) == 0 && same_bytes(back.data, back.length, data.data, data.length),
+          "the file is unchanged");
+    lzfse_zazzcat_decmpfs_free(&c);
+    lzfse_zazzcat_buffer_free(&data);
+    lzfse_zazzcat_buffer_free(&back);
+    bare_unlink(path);
+}
+
 void run_apple_tests(void) {
     RUN_TEST(test_lzfse_both_directions);
     RUN_TEST(test_lzvn_both_directions);
     RUN_TEST(test_ratio_close_to_apple);
     RUN_TEST(test_system_compressed_files);
     RUN_TEST(test_kernel_reads_our_files);
+    RUN_TEST(test_apply_reports_the_failing_step);
 }
 
 #endif

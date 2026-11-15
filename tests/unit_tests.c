@@ -1041,6 +1041,37 @@ static void test_stats_totals_match_the_input(void) {
 }
 
 // The Apple interoperability tests (they define run_apple_tests, which does nothing on other systems).
+// Every status has its own description, so error messages never say "unknown status".
+static void test_status_strings_are_distinct(void) {
+    lzfse_zazzcat_status all[] = {LZFSE_ZAZZCAT_OK,
+                                  LZFSE_ZAZZCAT_TRUNCATED,
+                                  LZFSE_ZAZZCAT_CORRUPT,
+                                  LZFSE_ZAZZCAT_OUTPUT_TOO_SMALL,
+                                  LZFSE_ZAZZCAT_OUT_OF_MEMORY,
+                                  LZFSE_ZAZZCAT_INVALID_ARGUMENT,
+                                  LZFSE_ZAZZCAT_UNSUPPORTED,
+                                  LZFSE_ZAZZCAT_SYSTEM_ERROR,
+                                  LZFSE_ZAZZCAT_NOT_APPLIED};
+    size_t n = sizeof all / sizeof all[0];
+    for (size_t i = 0; i < n; i++) {
+        const char *text = lzfse_zazzcat_status_string(all[i]);
+        CHECK(strcmp(text, "unknown status") != 0, "status %d has no description", (int)all[i]);
+        for (size_t j = 0; j < i; j++) CHECK(strcmp(text, lzfse_zazzcat_status_string(all[j])) != 0, "duplicate");
+    }
+}
+
+#ifndef __APPLE__
+// Outside macOS, applying decmpfs attributes reports UNSUPPORTED and names why.
+static void test_apply_is_unsupported_off_macos(void) {
+    lzfse_zazzcat_decmpfs c;
+    REQUIRE(lzfse_zazzcat_decmpfs_compress("hello", 5, &c) == LZFSE_ZAZZCAT_OK, "compress");
+    const char *step = NULL;
+    CHECK(lzfse_zazzcat_decmpfs_apply(-1, &c, &step) == LZFSE_ZAZZCAT_UNSUPPORTED, "apply off macOS");
+    CHECK(step != NULL, "a reason is given");
+    lzfse_zazzcat_decmpfs_free(&c);
+}
+#endif
+
 #include "apple_tests.c"
 
 int main(void) {
@@ -1079,6 +1110,10 @@ int main(void) {
     RUN_TEST(test_reused_encoder_matches_fresh);
     RUN_TEST(test_chunks_round_trip_in_order);
     RUN_TEST(test_decmpfs_layouts_round_trip);
+    RUN_TEST(test_status_strings_are_distinct);
+#ifndef __APPLE__
+    RUN_TEST(test_apply_is_unsupported_off_macos);
+#endif
     RUN_TEST(test_stats_totals_match_the_input);
     run_apple_tests();
     if (test_failures) {
