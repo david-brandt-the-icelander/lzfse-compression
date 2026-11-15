@@ -239,8 +239,8 @@ ALWAYS_INLINE uint8_t *emit_literals(uint8_t *at, const uint8_t *literals, size_
     while (count > 0) {
         size_t n = min_size(count, 271);
         if (n >= 16) {
-            at[0] = 0xE0;
-            at[1] = (uint8_t)(n - 16);
+            // Opcode 0xE0 then the length byte, built as one little-endian value and stored at once.
+            store_u16(at, (uint16_t)(0xE0 | (n - 16) << 8));
             at += 2;
         } else {
             *at++ = (uint8_t)(0xE0 | n);
@@ -263,8 +263,8 @@ static uint8_t *emit_repeat(uint8_t *at, size_t length) {
     while (length > 0) {
         size_t n = min_size(length, 271);
         if (n >= 16) {
-            at[0] = 0xF0;
-            at[1] = (uint8_t)(n - 16);
+            // Opcode 0xF0 then the length byte, stored at once as in emit_literals.
+            store_u16(at, (uint16_t)(0xF0 | (n - 16) << 8));
             at += 2;
         } else {
             *at++ = (uint8_t)(0xF0 | n);
@@ -290,22 +290,23 @@ static uint8_t *emit_token(uint8_t *at, const uint8_t *literals, size_t literal_
         first = min_size(length, max_short_match(literal_count));
         *at++ = (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 6);
     } else if (distance < 16384 && (length > max_short_match(literal_count) || distance >= 1536)) {
+        // The 3-byte opcodes are built as one little-endian value (byte 0 in the low bits) and written with a single
+        // 4-byte store instead of three byte stores. The 4th byte is garbage: like the literal copy below, it lands
+        // in reserved space that the next output overwrites (at least the 8-byte end-of-stream trailer follows).
         first = min_size(length, 34);
         size_t word = (distance << 2) | ((first - 3) & 3);
-        at[0] = (uint8_t)(0xA0 | (literal_count << 3) | ((first - 3) >> 2));
-        at[1] = (uint8_t)word;
-        at[2] = (uint8_t)(word >> 8);
+        size_t opcode = 0xA0 | (literal_count << 3) | ((first - 3) >> 2);
+        store_u32(at, (uint32_t)(opcode | word << 8));
         at += 3;
     } else if (distance < 1536) {
         first = min_size(length, max_short_match(literal_count));
-        at[0] = (uint8_t)((literal_count << 6) | ((first - 3) << 3) | (distance >> 8));
-        at[1] = (uint8_t)distance;
+        size_t opcode = (literal_count << 6) | ((first - 3) << 3) | (distance >> 8);
+        store_u16(at, (uint16_t)(opcode | (distance & 0xFF) << 8));
         at += 2;
     } else {
         first = min_size(length, max_short_match(literal_count));
-        at[0] = (uint8_t)((literal_count << 6) | ((first - 3) << 3) | 7);
-        at[1] = (uint8_t)distance;
-        at[2] = (uint8_t)(distance >> 8);
+        size_t opcode = (literal_count << 6) | ((first - 3) << 3) | 7;
+        store_u32(at, (uint32_t)(opcode | distance << 8));
         at += 3;
     }
     if (literal_count > 0) {
