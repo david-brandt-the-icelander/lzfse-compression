@@ -323,8 +323,7 @@ ALWAYS_INLINE size_t lzvn_hash(uint32_t four_bytes, uint32_t shift) {
 
 lzfse_zazzcat_status lzvn_encode_with_table(const uint8_t *source, size_t n, lzfse_zazzcat_buffer *out,
                                             lzvn_hash_table *table) {
-    // Every input byte costs at most 2 output bytes (a literal plus its share of an opcode), plus the trailer.
-    if (!buffer_reserve(out, 2 * n + 64)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    if (!buffer_reserve(out, lzvn_encode_bound(n))) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
     // Small inputs get small tables: about one bucket per 4 input bytes, between 2^8 and 2^14.
     uint32_t bits = n == 0 ? 0 : (uint32_t)(64 - __builtin_clzll((unsigned long long)n));
     bits = bits >= 2 ? bits - 2 : 0;
