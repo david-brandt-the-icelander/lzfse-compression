@@ -2,9 +2,10 @@
 
 LZFSE (Apple's compression format) implemented from scratch in C (C11), aiming to beat Apple's `libcompression` on Apple Silicon. Plan and format notes: `docs/DESIGN.md`.
 
+Target: Apple Silicon (M1 and later) on macOS. Linux builds and tests only so the code can be worked on in the cloud; no other platform is supported. Code may rely on what both share, such as a null pointer being all zero bits (checked by `test_null_pointer_is_all_zero_bits`).
+
 ## Rules
 - Never copy or translate Apple's reference code (`lzfse/lzfse`, BSD-3-Clause). Consulting it for format facts and studying its encoder's design is allowed (owner's decision, 2026-11-14); say so in the commit message.
-- Write for a reader who is new to the code base and has not used C for a while: descriptive identifiers (`literal_length`, not `l`), and short comments that say what something is for and explain non-obvious C idioms (unaligned loads through `memcpy`, `static inline`, wrap-around tricks).
 - Every function, struct, enum and macro gets one short comment; public API comments live in `include/lzfse_zazzcat.h`.
 - Public names start with `lzfse_zazzcat_` (macros `LZFSE_ZAZZCAT_`); internal names are plain and live in `src/` headers.
 - Decoding handles untrusted input: return a status, never crash, never read or write out of bounds. Wide copies check their room once per token (`decode_token_fast`); anything rare goes to a cold, exact path. The sanitizer build (`make test-sanitize`) and the fuzz targets must stay clean.
