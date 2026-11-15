@@ -626,6 +626,22 @@ static void test_wild_copy(void) {
     }
 }
 
+// Every length 0–100: the bytes arrive, and nothing outside them is written. The source is a heap block of exactly
+// `n` bytes, so the sanitizer build also catches any read past its end.
+static void test_copy_exact_inline(void) {
+    for (size_t n = 0; n <= 100; n++) {
+        uint8_t *source = raw_malloc(n + 1);
+        CHECK(source != NULL, "n=%zu: out of memory", n);
+        for (size_t i = 0; i < n; i++) source[i] = (uint8_t)(i + 1);
+        uint8_t destination[120] = {0};
+        copy_exact_inline(destination + 3, source, n);
+        CHECK(equal_bytes(destination + 3, source, n), "n=%zu", n);
+        for (size_t i = 0; i < 3; i++) CHECK(destination[i] == 0, "n=%zu wrote before the start at %zu", n, i);
+        for (size_t i = 3 + n; i < 120; i++) CHECK(destination[i] == 0, "n=%zu wrote past the end at %zu", n, i);
+        raw_free(source);
+    }
+}
+
 static void test_decode_token_fast_matches_reference(void) {
     uint8_t literals[120];
     for (int i = 0; i < 120; i++) literals[i] = (uint8_t)(100 + i);
@@ -1047,6 +1063,7 @@ int main(void) {
     RUN_TEST(test_match_lengths);
     RUN_TEST(test_copy_match_exact);
     RUN_TEST(test_wild_copy);
+    RUN_TEST(test_copy_exact_inline);
     RUN_TEST(test_decode_token_fast_matches_reference);
     RUN_TEST(test_sizes_and_block_types);
     RUN_TEST(test_compressible_inputs);

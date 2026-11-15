@@ -233,7 +233,9 @@ static size_t max_short_match(size_t literal_count) {
 // Append literal-only opcodes for `count` bytes at `literals`, of which `readable` bytes may be read. When at least
 // 16 bytes beyond each piece may be read, the piece is copied with wild_copy, which can write up to 15 bytes past
 // it; the output's reservation (2 bytes per input byte plus 64) leaves room, and later output overwrites them.
-static uint8_t *emit_literals(uint8_t *at, const uint8_t *literals, size_t count, size_t readable) {
+// Nearer the end, copy_exact_inline copies exactly. Always inlined: with that copy inside, the compiler would
+// otherwise make this a separate function, and the encoder loop would call it for every literal run.
+ALWAYS_INLINE uint8_t *emit_literals(uint8_t *at, const uint8_t *literals, size_t count, size_t readable) {
     while (count > 0) {
         size_t n = min_size(count, 271);
         if (n >= 16) {
@@ -246,7 +248,7 @@ static uint8_t *emit_literals(uint8_t *at, const uint8_t *literals, size_t count
         if (n + 16 <= readable) {
             wild_copy(at, literals, n);
         } else {
-            copy_bytes(at, literals, n);
+            copy_exact_inline(at, literals, n);
         }
         at += n;
         literals += n;

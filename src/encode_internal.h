@@ -63,11 +63,11 @@ ALWAYS_INLINE void block_writer_token(block_writer *blocks, const uint8_t *sourc
     t->match_length = length;
     t->distance = distance;
     // Wide copy of the literals; any overshoot lands in the slack and the next literals overwrite it. Near the end
-    // of the input there may be fewer than 16 spare bytes to read, so copy exactly there.
+    // of the input there may be fewer than 16 spare bytes to read, so copy exactly there (inline, without a call).
     if (literal_start + literal_length + 16 <= source_length) {
         wild_copy(literal_destination, source + literal_start, literal_length);
     } else {
-        copy_bytes(literal_destination, source + literal_start, literal_length);
+        copy_exact_inline(literal_destination, source + literal_start, literal_length);
     }
 }
 
