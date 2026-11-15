@@ -80,6 +80,31 @@ ALWAYS_INLINE void wild_copy(uint8_t *destination, const uint8_t *source, size_t
     }
 }
 
+// Copy exactly `length` bytes, reading and writing nothing outside them, with inline loads and stores instead of a
+// call to memcpy: 16-byte steps, then one last 16-byte step that ends exactly at the end (it may overlap the step
+// before it, which is harmless because the source and destination do not overlap). Shorter copies use two
+// overlapping 8- or 4-byte steps, or three single bytes, which together cover any length from 1 to 3.
+//
+// For the encoders' literal copies near the end of the input, where wild_copy would read past it. A memcpy call
+// there, even one that rarely runs, sits inside the parse loop and makes the compiler save and reload the loop's
+// values around it on every token.
+ALWAYS_INLINE void copy_exact_inline(uint8_t *destination, const uint8_t *source, size_t length) {
+    if (length >= 16) {
+        for (size_t done = 0; done + 16 < length; done += 16) copy16(destination + done, source + done);
+        copy16(destination + length - 16, source + length - 16);
+    } else if (length >= 8) {
+        copy8(destination, source);
+        copy8(destination + length - 8, source + length - 8);
+    } else if (length >= 4) {
+        store_u32(destination, load_u32(source));
+        store_u32(destination + length - 4, load_u32(source + length - 4));
+    } else if (length > 0) {
+        destination[0] = source[0];
+        destination[length / 2] = source[length / 2];
+        destination[length - 1] = source[length - 1];
+    }
+}
+
 // Execute one decoded token in the decoder's hot loop: copy `literal_length` literals from
 // `literals + literal_position`, then `match_length` bytes from `distance` back, to `output + position`.
 // One combined check stands for all the copies' bounds and the body makes no function calls, so the decoder's
