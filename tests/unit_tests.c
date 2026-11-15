@@ -55,6 +55,23 @@ static uint32_t first_magic(const lzfse_zazzcat_buffer *stream) {
     return stream->length >= 4 ? load_u32(stream->data) : 0;
 }
 
+// --- Platform assumptions ---
+
+// The library zeroes structs that hold pointers (zz_calloc, clear_bytes) and expects those pointers to read back as
+// NULL. C does not promise that a null pointer is stored as all zero bits, and C11 has no compile-time way to look
+// at a pointer's bytes, so check both directions here. Holds on Apple Silicon (the target) and on Linux.
+static void test_null_pointer_is_all_zero_bits(void) {
+    void *null_pointer = NULL;
+    unsigned char null_bytes[sizeof null_pointer];
+    copy_bytes(null_bytes, &null_pointer, sizeof null_pointer);
+    unsigned char zero_bytes[sizeof null_pointer] = {0};
+    CHECK(equal_bytes(null_bytes, zero_bytes, sizeof null_bytes), "NULL is not stored as all zero bits");
+
+    void *zeroed_pointer = &null_pointer;
+    clear_bytes(&zeroed_pointer, sizeof zeroed_pointer);
+    CHECK(zeroed_pointer == NULL, "a pointer cleared to zero bytes is not NULL");
+}
+
 // --- Format ---
 
 // The symbol whose base is the largest one not above `value` (a slow reference for the fast symbol functions).
@@ -934,6 +951,7 @@ static void test_stats_totals_match_the_input(void) {
 #include "apple_tests.c"
 
 int main(void) {
+    RUN_TEST(test_null_pointer_is_all_zero_bits);
     RUN_TEST(test_fast_symbols_match_search);
     RUN_TEST(test_frequency_codes_round_trip);
     RUN_TEST(test_symbol_boundaries);
