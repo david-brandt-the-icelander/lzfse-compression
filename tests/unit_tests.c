@@ -259,6 +259,81 @@ static void test_normalize_sums_exactly(void) {
     }
 }
 
+// Largest-remainder rounding written the plain way, as a reference for fse_normalize: each used symbol gets the
+// floor of its share (at least 1); the leftover states go one each to the largest remainders, lower symbols first
+// on a tie, picked by scanning for the largest one still unpicked; any excess is taken from the largest
+// frequencies exactly as fse_normalize does.
+static void reference_normalize(const uint32_t *counts, size_t symbol_count, uint32_t state_count,
+                                uint16_t *frequencies) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < symbol_count; i++) total += counts[i];
+    uint64_t remainders[256];
+    bool picked[256];
+    uint32_t assigned = 0;
+    for (size_t i = 0; i < symbol_count; i++) {
+        frequencies[i] = 0;
+        picked[i] = counts[i] == 0;
+        if (counts[i] == 0 || total == 0) continue;
+        uint64_t scaled = (uint64_t)counts[i] * state_count;
+        uint32_t share = (uint32_t)(scaled / total);
+        if (share < 1) share = 1;
+        frequencies[i] = (uint16_t)share;
+        assigned += share;
+        remainders[i] = scaled % total;
+    }
+    if (total == 0) return;
+    for (uint32_t left = assigned < state_count ? state_count - assigned : 0; left > 0; left--) {
+        size_t best = symbol_count;
+        for (size_t i = 0; i < symbol_count; i++) {
+            if (!picked[i] && (best == symbol_count || remainders[i] > remainders[best])) best = i;
+        }
+        frequencies[best]++;
+        picked[best] = true;
+    }
+    uint32_t excess = assigned > state_count ? assigned - state_count : 0;
+    while (excess > 0) {
+        size_t largest = 0;
+        for (size_t i = 1; i < symbol_count; i++) {
+            if (frequencies[i] > frequencies[largest]) largest = i;
+        }
+        if (frequencies[largest] <= 1) break;
+        uint32_t take = (frequencies[largest] - 1u) / 2;
+        if (take > excess) take = excess;
+        if (take < 1) take = 1;
+        frequencies[largest] = (uint16_t)(frequencies[largest] - take);
+        excess -= take;
+    }
+}
+
+// fse_normalize picks the leftover states with a quickselect on packed keys; check it against the plain
+// reference on random counts of every alphabet size, including many ties and many unused symbols.
+static void test_normalize_matches_reference(void) {
+    test_random random = {12345};
+    size_t sizes[] = {LITERAL_LENGTH_SYMBOLS, DISTANCE_SYMBOLS, LITERAL_SYMBOLS};
+    uint32_t state_counts[] = {LITERAL_LENGTH_STATES, DISTANCE_STATES, LITERAL_STATES};
+    for (int round = 0; round < 3000; round++) {
+        int alphabet = round % 3;
+        size_t size = sizes[alphabet];
+        // Small ranges give many equal remainders; zeros give unused symbols; a few huge counts force clamping.
+        uint32_t range = round % 5 == 0 ? 4 : round % 5 == 1 ? 100 : 40000;
+        uint32_t counts[256];
+        for (size_t i = 0; i < size; i++) {
+            uint32_t r = test_random_next(&random);
+            counts[i] = r % 3 == 0 ? 0 : r % range;
+        }
+        if (round % 7 == 0) counts[test_random_next(&random) % size] = 1000000;
+        uint16_t frequencies[256], expected[256];
+        fse_normalize(counts, size, state_counts[alphabet], frequencies);
+        reference_normalize(counts, size, state_counts[alphabet], expected);
+        bool same = true;
+        for (size_t i = 0; i < size; i++) same = same && frequencies[i] == expected[i];
+        if (!same) {
+            CHECK(0, "round %d", round);
+            break;
+        }
+    }
+}
+
 static void test_fse_literals_round_trip(void) {
     uint32_t state_counts[] = {1024, 64, 256};
     size_t symbol_counts[] = {256, 20, 64};
@@ -280,11 +355,13 @@ static void test_fse_literals_round_trip(void) {
         out.length = 8;
         bit_writer writer;
         bit_writer_start(&writer, &out);
-        uint32_t state = 0;
+        // The encoder's state runs in [n, 2n); the decoder's state is that minus n.
+        uint32_t state = n;
         for (int i = 4999; i >= 0; i--) {
             fse_encode(&state, &encoder[data[i]], &writer);
             bit_writer_flush(&writer);
         }
+        state -= n;
         int32_t padding = bit_writer_finish(&writer, &out);
         // Pad the frequencies to a full literal table so the literal decoder can read them.
         uint16_t literal_frequencies[256] = {0};
@@ -391,7 +468,7 @@ static void test_single_symbol_uses_no_bits(void) {
     bare_buffer_reserve(&out, 64);
     bit_writer writer;
     bit_writer_start(&writer, &out);
-    uint32_t state = 0;
+    uint32_t state = 64;
     for (int i = 0; i < 100; i++) fse_encode(&state, &encoder[2], &writer);
     CHECK(bit_writer_finish(&writer, &out) == 0 && out.length == 0, "no bits written");
     lzfse_zazzcat_buffer_free(&out);
@@ -960,6 +1037,7 @@ int main(void) {
     RUN_TEST(test_bits_read_back_in_reverse);
     RUN_TEST(test_bit_reader_rejects_bad_starts);
     RUN_TEST(test_normalize_sums_exactly);
+    RUN_TEST(test_normalize_matches_reference);
     RUN_TEST(test_fse_literals_round_trip);
     RUN_TEST(test_fse_decoder_tables_match_reference);
     RUN_TEST(test_single_symbol_uses_no_bits);

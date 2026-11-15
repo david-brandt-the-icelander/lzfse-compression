@@ -241,7 +241,9 @@ larger.
 
 **64 KiB fast path** (`src/encode_small.c`). Inputs of at most 64 KiB, which covers every APFS chunk and most files,
 use their own finder:
-- **16-bit positions:** the short table is 192 KiB and the long table 32 KiB, against 512 + 256 KiB for large inputs.
+- **16-bit positions:** the short table is 128 KiB and the long table 32 KiB, against 512 + 256 KiB for large inputs.
+- **Packed buckets:** a bucket is two 64-bit words, its four positions and four 16-bit hash tags, so recording a
+  position is one shift and OR per word (see blogs/2026-11-15-narrower-numbers-and-packed-words.md).
 - **Cleared on each call**, so no stale-entry checks are needed.
 - **No distance-limit check:** a distance can never exceed 262,139 bytes.
 - **Sized to the input:** the tables shrink to 1/8 of that for 8 KiB and below. Each size is a separate
