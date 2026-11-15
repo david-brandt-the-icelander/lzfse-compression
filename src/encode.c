@@ -263,8 +263,12 @@ lzfse_zazzcat_status lzfse_zazzcat_encode(const void *source, size_t length, con
                                           lzfse_zazzcat_buffer *output) {
     lzfse_zazzcat_encoder *encoder = lzfse_zazzcat_encoder_create(options);
     if (encoder == NULL) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-    // Reserve about half the input up front, as most inputs compress at least that well.
-    if (!buffer_reserve(output, length / 2 + 64)) {
+    // Reserve the output up front. Inputs below the LZVN threshold get everything the LZVN path will reserve
+    // (header, payload bound, end-of-stream marker), so it does not move the buffer straight away; larger inputs
+    // get about half their size, as most inputs compress at least that well.
+    size_t initial =
+        length < LZFSE_ZAZZCAT_LZVN_THRESHOLD ? LZVN_HEADER_SIZE + lzvn_encode_bound(length) + 4 : length / 2 + 64;
+    if (!buffer_reserve(output, initial)) {
         lzfse_zazzcat_encoder_destroy(encoder);
         return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
     }
