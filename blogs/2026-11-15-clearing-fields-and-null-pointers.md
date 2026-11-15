@@ -52,6 +52,26 @@ always-inline helper for each clear, defined right beside the struct it clears: 
 struct, and one per partial clear (`clean_foo_entirely` and `clean_foo_data_and_length`, say). Whoever changes the
 struct then sees every clear that depends on it. That work will happen in a separate session.
 
+## Will the clean helpers be faster?
+
+No, the partial ones included. They are worth writing to keep each clear beside its struct, but not for speed:
+
+- **An inlined helper is the code it replaces.** Once an always-inline helper is expanded, the compiler sees
+  exactly the stores it sees today. The table above already shows that the field-by-field form, `clear_bytes`
+  and `(T){0}` give the same instructions.
+- **Partial clears are already as cheap as they get.** `block_writer_reset` sets five fields with four stores;
+  the two neighbouring counters at the start of the struct already share one paired store.
+- **The only possible gain needs a different struct layout.** If the fields a partial clear touches were moved
+  next to each other, two stores might become one paired store. In `block_writer`, which is reset once per
+  block, that saves at most one instruction per block, far too little to measure.
+- **None of these clears is in a hot loop.** They are free functions, an out-of-memory path and once-per-block
+  resets. `bit_writer_start` is the only one near hot code, and its writer is a local variable whose fields stay
+  in registers, so there are no stores to save.
+
+One thing the helpers must not do: the structs left uncleared on purpose (the decoder with its FSE tables, and
+`block_header`) must not end up being set up by a clean-entirely helper instead of today's few field
+assignments. That would bring back the multi-kilobyte clears the earlier change removed.
+
 ## Is a null pointer all zero bits?
 
 `clear_bytes` writes zero bytes, and so does `zz_calloc`. Code that zeroes a struct this way and then tests a
