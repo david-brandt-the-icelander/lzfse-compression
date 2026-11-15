@@ -17,30 +17,11 @@ ALWAYS_INLINE void buffer_append_reserved(lzfse_zazzcat_buffer *buffer, const vo
     buffer->length += count;
 }
 
-// Append one byte into reserved capacity.
+// Append one byte into reserved capacity. Fine for cold code; hot loops write through a local cursor instead
+// (as the LZVN encoder does): a store through a `uint8_t *` may change any object, `buffer` included, so after
+// every push the compiler must reload `data` and `length`.
 ALWAYS_INLINE void buffer_push_reserved(lzfse_zazzcat_buffer *buffer, uint8_t byte) {
     buffer->data[buffer->length++] = byte;
-}
-
-// Append two bytes into reserved capacity. Use this (or the 3-byte version) instead of several
-// buffer_push_reserved calls: a store through a `uint8_t *` is allowed to change any object, `buffer` included,
-// so after every one-byte push the compiler must reload `data` and `length`. Here they are read once.
-ALWAYS_INLINE void buffer_push_2_reserved(lzfse_zazzcat_buffer *buffer, uint8_t first, uint8_t second) {
-    size_t length = buffer->length;
-    uint8_t *at = buffer->data + length;
-    at[0] = first;
-    at[1] = second;
-    buffer->length = length + 2;
-}
-
-// Append three bytes into reserved capacity (see buffer_push_2_reserved).
-ALWAYS_INLINE void buffer_push_3_reserved(lzfse_zazzcat_buffer *buffer, uint8_t first, uint8_t second, uint8_t third) {
-    size_t length = buffer->length;
-    uint8_t *at = buffer->data + length;
-    at[0] = first;
-    at[1] = second;
-    at[2] = third;
-    buffer->length = length + 3;
 }
 
 // Append a little-endian 32-bit integer into reserved capacity.
