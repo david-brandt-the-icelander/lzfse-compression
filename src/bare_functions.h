@@ -124,6 +124,10 @@ static inline void bare_pclose(FILE *pipe) {
     (void)pclose(pipe);
 }
 
+static inline void bare_close(int descriptor) {
+    (void)close(descriptor);
+}
+
 static inline void bare_closedir(DIR *directory) {
     (void)closedir(directory);
 }

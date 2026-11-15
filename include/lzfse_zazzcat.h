@@ -32,6 +32,12 @@ typedef enum lzfse_zazzcat_status {
     LZFSE_ZAZZCAT_OUT_OF_MEMORY = -4,
     // An argument was invalid (for example a chunk size of 0).
     LZFSE_ZAZZCAT_INVALID_ARGUMENT = -5,
+    // The operation needs an operating system feature this system lacks (decmpfs files outside macOS).
+    LZFSE_ZAZZCAT_UNSUPPORTED = -6,
+    // A system call failed; errno says why.
+    LZFSE_ZAZZCAT_SYSTEM_ERROR = -7,
+    // The kernel accepted every call but the file does not read as compressed with the expected size.
+    LZFSE_ZAZZCAT_NOT_APPLIED = -8,
 } lzfse_zazzcat_status;
 
 // A few words describing a status, for error messages.
@@ -158,8 +164,8 @@ lzfse_zazzcat_status lzfse_zazzcat_lzvn_decode(const void *source, size_t source
 //
 // A compressed file has an empty data fork, a `com.apple.decmpfs` extended attribute starting with a 16-byte
 // header, and, for the resource-fork types, its data in `com.apple.ResourceFork`: a table of little-endian 32-bit
-// offsets (one per 64 KiB chunk plus one for the end) followed by the chunks. These functions only build and parse
-// the bytes; applying them to a file is up to the caller.
+// offsets (one per 64 KiB chunk plus one for the end) followed by the chunks. lzfse_zazzcat_decmpfs_compress builds
+// those bytes and lzfse_zazzcat_decmpfs_apply puts them on a file (macOS only).
 
 // Uncompressed size of each chunk.
 #define LZFSE_ZAZZCAT_DECMPFS_CHUNK 65536
@@ -186,6 +192,17 @@ lzfse_zazzcat_status lzfse_zazzcat_decmpfs_compress(const void *data, size_t dat
 
 // Release both attribute buffers.
 void lzfse_zazzcat_decmpfs_free(lzfse_zazzcat_decmpfs *compressed);
+
+// Make the open file `fd` (opened for writing) a transparently compressed file holding `compressed`, which must
+// have been made from that file's current contents: set `com.apple.ResourceFork` (or remove a stale one for the
+// inline types), set `com.apple.decmpfs`, empty the data fork and add the compressed flag. Then check that the
+// kernel reports the flag and the original size. This empties the file's data before the kernel has accepted the
+// compressed form, so apply it to a copy and swap the copy in only after reading it back.
+// On LZFSE_ZAZZCAT_SYSTEM_ERROR errno holds the reason; on any failure `*failed_step` (if not NULL) names the step
+// ("setting com.apple.ResourceFork", for example), as a static string.
+// Returns LZFSE_ZAZZCAT_UNSUPPORTED outside macOS.
+lzfse_zazzcat_status lzfse_zazzcat_decmpfs_apply(int fd, const lzfse_zazzcat_decmpfs *compressed,
+                                                 const char **failed_step);
 
 // Read the compression type and uncompressed size from a `com.apple.decmpfs` attribute.
 lzfse_zazzcat_status lzfse_zazzcat_decmpfs_parse_header(const void *xattr, size_t xattr_length, uint32_t *type,

@@ -404,7 +404,7 @@ On the owner's Mac (macOS 27.2.1, 64 KiB chunks of a 47 MiB session log, Python 
 | M2 | Scalar encoder: LZVN and LZFSE `bvx2` | The compatibility matrix is green and the ratio is within 2% of Apple's | Done: within ±0.6% |
 | M3 | Benchmark harness and first report | A reproducible baseline report against `libcompression` | Done: `docs/benchmarks` |
 | M4 | Optimisation: parallel chunks, then kernels (portable C, then NEON or assembly) | The goal-2 targets are met. Every change shows a measured gain and passes differential tests | In progress: on the M1 Pro every input encodes and decodes faster than Apple's, on one core and in parallel |
-| M5 | decmpfs writer and `free-disk-space` integration | Type 11/12 files read back through the kernel | Writer done and kernel-verified; wiring into `free-disk-space` not started |
+| M5 | decmpfs writer and `free-disk-space` integration | Type 11/12 files read back through the kernel | Writer and `lzfse_zazzcat_decmpfs_apply` done and kernel-verified; wiring into `free-disk-space` in progress |
 | M6 | Conversion from Rust to C | Byte-identical encoder output, all tests ported and green | Done: 220 test inputs encode identically; unit, Apple, allocation, sanitizer and fuzz tests ported |
 
 ## 9. Owner decisions
