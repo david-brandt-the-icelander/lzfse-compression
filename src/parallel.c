@@ -40,7 +40,7 @@ typedef struct task_scratch {
 // Encode the chunks of task number `task` into that task's buffer, recording where each chunk's stream ends.
 static lzfse_zazzcat_status encode_task(lzfse_zazzcat_encoder *encoder, const chunk_layout *layout, size_t task,
                                         task_scratch *scratch) {
-    // Read the layout once: it is shared with other threads, and next to fields they keep writing (see `job`).
+    // Read the layout once into locals, so the loop below does not reload it.
     const uint8_t *source = layout->source;
     size_t length = layout->length, chunk_size = layout->chunk_size;
     size_t first_chunk = task * layout->chunks_per_task;
@@ -164,6 +164,7 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
 #else
 
 #include <pthread.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <unistd.h>
 
@@ -173,8 +174,10 @@ typedef struct job {
     lzfse_zazzcat_options options;
     // The pool's scratch arrays; each task writes only its own buffer and its own chunks' ends.
     task_scratch *scratch;
-    // Next task index to claim (threads take tasks until they run out), and the first error.
-    atomic_size_t next_task;
+    // Next task index to claim (threads take tasks until they run out), and the first error. They are written all the
+    // time, so they start their own 128-byte cache line (Apple Silicon's), apart from the fields above, which are
+    // read-only.
+    alignas(128) atomic_size_t next_task;
     atomic_int status;
 } job;
 
@@ -205,7 +208,9 @@ static pthread_once_t pool_once = PTHREAD_ONCE_INIT;
 static void run_tasks(job *j, size_t thread_index) {
     lzfse_zazzcat_encoder **encoder = &pool.encoders[thread_index];
     for (;;) {
-        size_t task = atomic_fetch_add(&j->next_task, 1);
+        // Relaxed is enough: this only hands out distinct indices, and the wake-up under `pool.mutex` published the
+        // job.
+        size_t task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed);
         if (task >= j->layout.task_count) return;
         lzfse_zazzcat_status status = LZFSE_ZAZZCAT_OK;
         if (*encoder == NULL) *encoder = lzfse_zazzcat_encoder_create(&j->options);
@@ -217,7 +222,9 @@ static void run_tasks(job *j, size_t thread_index) {
         }
         if (status != LZFSE_ZAZZCAT_OK) {
             int ok = LZFSE_ZAZZCAT_OK;
-            atomic_compare_exchange_strong(&j->status, &ok, (int)status);
+            // Relaxed is enough: only one error is kept, and the caller reads it after the join under `pool.mutex`.
+            atomic_compare_exchange_strong_explicit(&j->status, &ok, (int)status, memory_order_relaxed,
+                                                    memory_order_relaxed);
         }
     }
 }
@@ -318,7 +325,8 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
         pool.current_job = NULL;
         bare_pthread_mutex_unlock(&pool.mutex);
     }
-    lzfse_zazzcat_status status = (lzfse_zazzcat_status)atomic_load(&j.status);
+    lzfse_zazzcat_status status =
+        (lzfse_zazzcat_status)atomic_load_explicit(&j.status, memory_order_relaxed); // The join ordered it.
     if (status == LZFSE_ZAZZCAT_OK) {
         status = gather(&j.layout, &pool.scratch, output, offsets);
     }
