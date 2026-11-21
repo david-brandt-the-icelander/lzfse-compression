@@ -1040,6 +1040,8 @@ static void test_stats_totals_match_the_input(void) {
     lzfse_zazzcat_buffer_free(&random);
 }
 
+#include "branch_tests.c"
+
 // The Apple interoperability tests (they define run_apple_tests, which does nothing on other systems).
 // Every status has its own description, so error messages never say "unknown status".
 static void test_status_strings_are_distinct(void) {
@@ -1115,6 +1117,26 @@ int main(void) {
     RUN_TEST(test_apply_is_unsupported_off_macos);
 #endif
     RUN_TEST(test_stats_totals_match_the_input);
+    RUN_TEST(test_mixed_stream_damage);
+    RUN_TEST(test_stats_of_every_block_type);
+    RUN_TEST(test_crafted_lzfse_blocks);
+    RUN_TEST(test_validate_rejects_each_field);
+    RUN_TEST(test_v2_header_table_edges);
+    RUN_TEST(test_lzvn_opcode_sweep);
+    RUN_TEST(test_lzvn_block_size_mismatches);
+    RUN_TEST(test_options_are_clamped);
+    RUN_TEST(test_encoder_reuse_across_sizes);
+    RUN_TEST(test_incompressible_blocks_are_stored);
+    RUN_TEST(test_chunk_edge_cases);
+    RUN_TEST(test_normalize_shapes);
+    RUN_TEST(test_decmpfs_headers_and_inline_chunks);
+    RUN_TEST(test_decmpfs_fork_tables);
+    RUN_TEST(test_unknown_status_string);
+    RUN_TEST(test_bit_stream_limits);
+    RUN_TEST(test_read_u32_past_the_end);
+    RUN_TEST(test_decmpfs_decompress_needs_a_header);
+    RUN_TEST(test_large_input_starting_with_zeros);
+    RUN_TEST(test_position_base_starts_over);
     run_apple_tests();
     if (test_failures) {
         bare_printf("%d check(s) failed\n", test_failures);

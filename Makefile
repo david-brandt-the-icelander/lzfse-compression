@@ -3,7 +3,7 @@
 #   make                  library, CLI and benchmark (optimized)
 #   make test             unit and round-trip tests (plus the Apple interoperability tests on macOS)
 #   make test-sanitize    the tests under AddressSanitizer and UndefinedBehaviorSanitizer
-#   make test-alloc       allocation-count tests
+#   make test-alloc       allocation-count tests and out-of-memory tests
 #   make fuzz             fuzz targets (needs clang with libFuzzer), run with FUZZ_SECONDS each
 #   make format-check     check formatting with clang-format
 #
@@ -65,8 +65,15 @@ $(BUILD)/alloc-tests: tests/alloc_tests.c tests/test_support.h $(LIB_SOURCES) $(
 	@mkdir -p $(BUILD)
 	$(CC) $(TEST_FLAGS) -DLZFSE_ZAZZCAT_COUNT_ALLOCATIONS -o $@ tests/alloc_tests.c $(LIB_SOURCES) $(LIBS)
 
-test-alloc: $(BUILD)/alloc-tests
+$(BUILD)/oom-tests: tests/oom_tests.c tests/test_support.h $(LIB_SOURCES) $(LIB_HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(TEST_FLAGS) -DLZFSE_ZAZZCAT_COUNT_ALLOCATIONS -o $@ tests/oom_tests.c $(LIB_SOURCES) $(LIBS)
+
+# The out-of-memory tests run twice: the thread pool's start-up check needs a process nothing has used the pool in.
+test-alloc: $(BUILD)/alloc-tests $(BUILD)/oom-tests
 	$(BUILD)/alloc-tests
+	$(BUILD)/oom-tests pool
+	$(BUILD)/oom-tests
 
 FUZZ_TARGETS := decode round_trip lzvn_decode decmpfs
 FUZZ_SECONDS ?= 60

@@ -397,6 +397,77 @@ static void test_apply_reports_the_failing_step(void) {
     bare_unlink(path);
 }
 
+// The failure paths of lzfse_zazzcat_decmpfs_apply that need no unusual file system: a damaged header, a descriptor
+// that is not open (with and without a resource fork to set, with and without a step name wanted), an attribute
+// the file system refuses, and a type the kernel does not take.
+static void test_apply_failure_paths(void) {
+    lzfse_zazzcat_decmpfs empty = {{0}, {0}};
+    const char *step = NULL;
+    CHECK(lzfse_zazzcat_decmpfs_apply(-1, &empty, &step) == LZFSE_ZAZZCAT_CORRUPT && step != NULL, "no header");
+    CHECK(lzfse_zazzcat_decmpfs_apply(-1, &empty, NULL) == LZFSE_ZAZZCAT_CORRUPT, "no header, no step wanted");
+
+    lzfse_zazzcat_buffer small = words(300), large = words(200000);
+    lzfse_zazzcat_decmpfs inline_form, fork_form;
+    REQUIRE(lzfse_zazzcat_decmpfs_compress(small.data, small.length, &inline_form) == LZFSE_ZAZZCAT_OK, "compress");
+    REQUIRE(lzfse_zazzcat_decmpfs_compress(large.data, large.length, &fork_form) == LZFSE_ZAZZCAT_OK, "compress");
+    CHECK(inline_form.fork.length == 0 && fork_form.fork.length > 0, "one of each form");
+    CHECK(lzfse_zazzcat_decmpfs_apply(-1, &fork_form, &step) == LZFSE_ZAZZCAT_SYSTEM_ERROR && step != NULL,
+          "closed descriptor, resource fork");
+    CHECK(lzfse_zazzcat_decmpfs_apply(-1, &inline_form, &step) == LZFSE_ZAZZCAT_SYSTEM_ERROR && step != NULL,
+          "closed descriptor, inline");
+    CHECK(lzfse_zazzcat_decmpfs_apply(-1, &inline_form, NULL) == LZFSE_ZAZZCAT_SYSTEM_ERROR,
+          "closed descriptor, no step wanted");
+
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/lzfse-zazzcat-apply-%d", (int)getpid());
+    // A type the kernel does not know: depending on the macOS version it refuses the attribute, accepts it without
+    // compressing the file, or accepts it as it is.
+    lzfse_zazzcat_buffer bad_type = {0};
+    bare_buffer_append(&bad_type, inline_form.xattr.data, inline_form.xattr.length);
+    store_u32(bad_type.data + 4, 99);
+    lzfse_zazzcat_decmpfs odd = {bad_type, {0}};
+    REQUIRE(write_file(path, small.data, small.length) == 0, "write %s", path);
+    int fd = open(path, O_RDWR);
+    REQUIRE(fd >= 0, "open %s: %s", path, strerror(errno));
+    lzfse_zazzcat_status status = lzfse_zazzcat_decmpfs_apply(fd, &odd, &step);
+    bare_printf("    unknown type: %s at %s\n", lzfse_zazzcat_status_string(status), step != NULL ? step : "(none)");
+    CHECK(status == LZFSE_ZAZZCAT_OK || status == LZFSE_ZAZZCAT_NOT_APPLIED || status == LZFSE_ZAZZCAT_SYSTEM_ERROR,
+          "an unknown type gives a defined status");
+    bare_close(fd);
+    bare_unlink(path);
+    // An inline form on a file that has a resource fork from before: the apply removes it.
+    REQUIRE(write_file(path, small.data, small.length) == 0, "write %s", path);
+    fd = open(path, O_RDWR);
+    REQUIRE(fd >= 0, "open %s: %s", path, strerror(errno));
+    CHECK(fsetxattr(fd, "com.apple.ResourceFork", "old", 3, 0, 0) == 0, "set an old resource fork");
+    status = lzfse_zazzcat_decmpfs_apply(fd, &inline_form, &step);
+    CHECK(status == LZFSE_ZAZZCAT_OK, "apply over an old resource fork: %s at %s", lzfse_zazzcat_status_string(status),
+          step != NULL ? step : "(none)");
+    CHECK(fgetxattr(fd, "com.apple.ResourceFork", NULL, 0, 0, 0) < 0, "the old resource fork is gone");
+    bare_close(fd);
+    bare_unlink(path);
+    // An attribute far over the size the kernel accepts.
+    lzfse_zazzcat_buffer huge = {0};
+    bare_buffer_append(&huge, inline_form.xattr.data, 16);
+    for (int i = 0; i < 4000; i++) bare_buffer_append(&huge, "x", 1);
+    odd.xattr = huge;
+    REQUIRE(write_file(path, small.data, small.length) == 0, "write %s", path);
+    fd = open(path, O_RDWR);
+    REQUIRE(fd >= 0, "open %s: %s", path, strerror(errno));
+    status = lzfse_zazzcat_decmpfs_apply(fd, &odd, &step);
+    bare_printf("    oversized attribute: %s at %s\n", lzfse_zazzcat_status_string(status),
+                step != NULL ? step : "(none)");
+    CHECK(status != LZFSE_ZAZZCAT_OK, "an oversized attribute is not applied");
+    bare_close(fd);
+    bare_unlink(path);
+    lzfse_zazzcat_buffer_free(&huge);
+    lzfse_zazzcat_buffer_free(&bad_type);
+    lzfse_zazzcat_decmpfs_free(&inline_form);
+    lzfse_zazzcat_decmpfs_free(&fork_form);
+    lzfse_zazzcat_buffer_free(&small);
+    lzfse_zazzcat_buffer_free(&large);
+}
+
 void run_apple_tests(void) {
     RUN_TEST(test_lzfse_both_directions);
     RUN_TEST(test_lzvn_both_directions);
@@ -404,6 +475,7 @@ void run_apple_tests(void) {
     RUN_TEST(test_system_compressed_files);
     RUN_TEST(test_kernel_reads_our_files);
     RUN_TEST(test_apply_reports_the_failing_step);
+    RUN_TEST(test_apply_failure_paths);
 }
 
 #endif

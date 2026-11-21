@@ -50,6 +50,14 @@ static inline void bare_lzfse_zazzcat_decode_into(const void *source, size_t sou
     (void)lzfse_zazzcat_decode_into(source, source_length, destination, destination_capacity, decoded_length);
 }
 
+static inline void bare_lzfse_zazzcat_decoded_length(const void *source, size_t source_length, size_t *length) {
+    (void)lzfse_zazzcat_decoded_length(source, source_length, length);
+}
+
+static inline void bare_lzfse_zazzcat_parallelism(void) {
+    (void)lzfse_zazzcat_parallelism();
+}
+
 static inline void bare_lzfse_zazzcat_decode(const void *source, size_t source_length, size_t limit,
                                              lzfse_zazzcat_buffer *output) {
     (void)lzfse_zazzcat_decode(source, source_length, limit, output);
