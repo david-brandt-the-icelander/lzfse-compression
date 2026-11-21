@@ -81,25 +81,49 @@ void lzfse_zazzcat_offsets_free(lzfse_zazzcat_offsets *offsets) {
     offsets->capacity = 0;
 }
 
-// Copy the tasks' buffers to `output` back to back and fill `offsets` with every stream's start and the end.
-static lzfse_zazzcat_status gather(const chunk_layout *layout, const task_scratch *scratch,
-                                   lzfse_zazzcat_buffer *output, lzfse_zazzcat_offsets *offsets) {
-    const lzfse_zazzcat_buffer *task_buffers = scratch->task_buffers;
-    size_t total = 0;
-    for (size_t t = 0; t < layout->task_count; t++) total += task_buffers[t].length;
-    if (!buffer_reserve(output, total) || !offsets_reserve(offsets, layout->chunk_count + 1)) {
-        return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
-    }
+// Where a gather writes: `base` is the output length before the call (the first stream starts there); the tasks'
+// bytes go to `destination`, back to back, and the offsets array gets one entry per stream end.
+typedef struct gather_target {
+    uint8_t *destination;
+    size_t base;
+    lzfse_zazzcat_offsets *offsets;
+} gather_target;
+
+// Reserve room in `output` and `offsets` for every task's bytes and every stream's end, and total the bytes.
+static bool gather_reserve(const chunk_layout *layout, const task_scratch *scratch, lzfse_zazzcat_buffer *output,
+                           lzfse_zazzcat_offsets *offsets, size_t *total) {
+    size_t sum = 0;
+    for (size_t t = 0; t < layout->task_count; t++) sum += scratch->task_buffers[t].length;
+    *total = sum;
+    return buffer_reserve(output, sum) && offsets_reserve(offsets, layout->chunk_count + 1);
+}
+
+// Copy task `task`'s buffer into place and fill the offsets of its chunks. Its place is the sum of the lengths of
+// the tasks before it (a handful of additions), so tasks can be gathered in any order, on any thread; each writes
+// only its own bytes and its own offsets entries.
+static void gather_task(const chunk_layout *layout, const task_scratch *scratch, size_t task,
+                        const gather_target *target) {
+    size_t at = 0;
+    for (size_t t = 0; t < task; t++) at += scratch->task_buffers[t].length;
+    copy_bytes(target->destination + at, scratch->task_buffers[task].data, scratch->task_buffers[task].length);
+    size_t first = task * layout->chunks_per_task;
+    size_t count = min_size(layout->chunks_per_task, layout->chunk_count - first);
+    for (size_t c = 0; c < count; c++)
+        target->offsets->data[first + c + 1] = target->base + at + scratch->ends[first + c];
+}
+
+// Start a gather after the reservation: aim at the end of `output` and write the first offsets entry.
+static gather_target gather_begin(const lzfse_zazzcat_buffer *output, lzfse_zazzcat_offsets *offsets) {
+    gather_target target = {.destination = output->data + output->length, .base = output->length, .offsets = offsets};
     offsets->data[0] = output->length;
-    offsets->length = 1;
-    for (size_t t = 0; t < layout->task_count; t++) {
-        size_t at = output->length;
-        buffer_append_reserved(output, task_buffers[t].data, task_buffers[t].length);
-        size_t first = t * layout->chunks_per_task;
-        size_t count = min_size(layout->chunks_per_task, layout->chunk_count - first);
-        for (size_t c = 0; c < count; c++) offsets->data[offsets->length++] = at + scratch->ends[first + c];
-    }
-    return LZFSE_ZAZZCAT_OK;
+    return target;
+}
+
+// Mark the gathered bytes and stream ends as present.
+static void gather_finish(const chunk_layout *layout, lzfse_zazzcat_buffer *output, lzfse_zazzcat_offsets *offsets,
+                          size_t total) {
+    output->length += total;
+    offsets->length = layout->chunk_count + 1;
 }
 
 // Make sure the scratch arrays hold one buffer per task and one end per chunk of `layout`.
@@ -123,6 +147,17 @@ static bool scratch_reserve(task_scratch *scratch, const chunk_layout *layout) {
 }
 
 #ifdef LZFSE_ZAZZCAT_NO_THREADS
+
+// Copy the (single) task's buffer to `output` back to back and fill `offsets` with every stream's start and the end.
+static lzfse_zazzcat_status gather(const chunk_layout *layout, const task_scratch *scratch,
+                                   lzfse_zazzcat_buffer *output, lzfse_zazzcat_offsets *offsets) {
+    size_t total;
+    if (!gather_reserve(layout, scratch, output, offsets, &total)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    gather_target target = gather_begin(output, offsets);
+    for (size_t t = 0; t < layout->task_count; t++) gather_task(layout, scratch, t, &target);
+    gather_finish(layout, output, offsets, total);
+    return LZFSE_ZAZZCAT_OK;
+}
 
 // Serial version: one encoder and one set of scratch arrays, kept between calls (not safe to call from two
 // threads).
@@ -167,6 +202,11 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
 #include <stdatomic.h>
 #include <unistd.h>
 
+// Below this many bytes the serial copy wins: another wake-and-join round trip through the pool costs tens of
+// microseconds (condition-variable wake-ups, waiting for the slowest thread), and one core copies 512 KiB in
+// roughly 50 microseconds, so there is little to save. Above it several cores move more bytes per second than one.
+#define PARALLEL_GATHER_MIN_BYTES ((size_t)512 << 10)
+
 // One call's work, shared by all threads while it runs.
 typedef struct job {
     chunk_layout layout;
@@ -176,6 +216,11 @@ typedef struct job {
     // Next task index to claim (threads take tasks until they run out), and the first error.
     atomic_size_t next_task;
     atomic_int status;
+    // Second phase (gather): when `gathering`, the threads claim tasks from `next_copy` and copy their buffers to
+    // `target` instead of encoding. Set before the workers are woken for it.
+    bool gathering;
+    gather_target target;
+    atomic_size_t next_copy;
 } job;
 
 // The persistent pool. Thread 0 is whichever thread calls lzfse_zazzcat_encode_chunks; threads 1.. are workers.
@@ -222,6 +267,24 @@ static void run_tasks(job *j, size_t thread_index) {
     }
 }
 
+// Claim and copy tasks' buffers of `j` (the gather phase) until none are left.
+static void run_copies(job *j) {
+    for (;;) {
+        size_t task = atomic_fetch_add(&j->next_copy, 1);
+        if (task >= j->layout.task_count) return;
+        gather_task(&j->layout, j->scratch, task, &j->target);
+    }
+}
+
+// Do this thread's share of the job's current phase.
+static void run_phase(job *j, size_t thread_index) {
+    if (j->gathering) {
+        run_copies(j);
+    } else {
+        run_tasks(j, thread_index);
+    }
+}
+
 // A worker thread: wait for each new job, help with its tasks, report that it is done.
 static void *worker_main(void *argument) {
     size_t thread_index = (size_t)(uintptr_t)argument;
@@ -232,7 +295,7 @@ static void *worker_main(void *argument) {
         seen_generation = pool.generation;
         job *j = pool.current_job;
         bare_pthread_mutex_unlock(&pool.mutex);
-        run_tasks(j, thread_index);
+        run_phase(j, thread_index);
         bare_pthread_mutex_lock(&pool.mutex);
         if (++pool.finished_workers == pool.thread_count - 1) bare_pthread_cond_signal(&pool.job_finished);
         bare_pthread_mutex_unlock(&pool.mutex);
@@ -263,6 +326,45 @@ static void pool_start(void) {
 size_t lzfse_zazzcat_parallelism(void) {
     bare_pthread_once(&pool_once, pool_start);
     return pool.thread_count;
+}
+
+// Run the job's current phase on the calling thread and, when `use_workers`, the pool's workers; return when every
+// thread has finished it.
+static void run_phase_on_pool(job *j, bool use_workers) {
+    if (use_workers) {
+        pthread_mutex_lock(&pool.mutex);
+        pool.current_job = j;
+        pool.finished_workers = 0;
+        pool.generation++;
+        pthread_cond_broadcast(&pool.job_ready);
+        pthread_mutex_unlock(&pool.mutex);
+    }
+    run_phase(j, 0);
+    if (use_workers) {
+        // Wait until every worker has stopped touching the job (it lives on the caller's stack).
+        pthread_mutex_lock(&pool.mutex);
+        while (pool.finished_workers < pool.thread_count - 1) pthread_cond_wait(&pool.job_finished, &pool.mutex);
+        pool.current_job = NULL;
+        bare_pthread_mutex_unlock(&pool.mutex);
+    }
+}
+
+// Gather the encoded tasks into `output` and `offsets`: reserve once, then copy the buffers into place, as a
+// second phase on the pool when there is enough to copy, else serially on this thread.
+static lzfse_zazzcat_status gather_chunks(job *j, bool use_workers, lzfse_zazzcat_buffer *output,
+                                          lzfse_zazzcat_offsets *offsets) {
+    size_t total;
+    if (!gather_reserve(&j->layout, j->scratch, output, offsets, &total)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    j->target = gather_begin(output, offsets);
+    if (use_workers && total >= PARALLEL_GATHER_MIN_BYTES) {
+        j->gathering = true;
+        atomic_init(&j->next_copy, 0);
+        run_phase_on_pool(j, true);
+    } else {
+        for (size_t t = 0; t < j->layout.task_count; t++) gather_task(&j->layout, j->scratch, t, &j->target);
+    }
+    gather_finish(&j->layout, output, offsets, total);
+    return LZFSE_ZAZZCAT_OK;
 }
 
 lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t length, size_t chunk_size,
@@ -302,26 +404,9 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
     }
     // Wake the workers only when there is more than one task for them to share.
     bool use_workers = pool.thread_count > 1 && j.layout.task_count > 1;
-    if (use_workers) {
-        pthread_mutex_lock(&pool.mutex);
-        pool.current_job = &j;
-        pool.finished_workers = 0;
-        pool.generation++;
-        pthread_cond_broadcast(&pool.job_ready);
-        pthread_mutex_unlock(&pool.mutex);
-    }
-    run_tasks(&j, 0);
-    if (use_workers) {
-        // Wait until every worker has stopped touching the job (it lives on this function's stack).
-        pthread_mutex_lock(&pool.mutex);
-        while (pool.finished_workers < pool.thread_count - 1) pthread_cond_wait(&pool.job_finished, &pool.mutex);
-        pool.current_job = NULL;
-        bare_pthread_mutex_unlock(&pool.mutex);
-    }
+    run_phase_on_pool(&j, use_workers);
     lzfse_zazzcat_status status = (lzfse_zazzcat_status)atomic_load(&j.status);
-    if (status == LZFSE_ZAZZCAT_OK) {
-        status = gather(&j.layout, &pool.scratch, output, offsets);
-    }
+    if (status == LZFSE_ZAZZCAT_OK) status = gather_chunks(&j, use_workers, output, offsets);
     bare_pthread_mutex_unlock(&pool.call_mutex);
     return status;
 }

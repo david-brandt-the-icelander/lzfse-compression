@@ -166,6 +166,19 @@ static void test_chunked_encoding(void) {
     CHECK(status == LZFSE_ZAZZCAT_OK && offsets.length == 65, "64 chunks");
     CHECK(chunks.calls == 0, "warmed-up chunked encoding made %zu allocations", chunks.calls);
     lzfse_zazzcat_buffer_free(&big);
+    // Incompressible input encodes to well over the size at which the gather copies in parallel.
+    lzfse_zazzcat_buffer noisy = noise(4 << 20, 7);
+    for (int i = 0; i < 3; i++) {
+        out.length = 0;
+        bare_lzfse_zazzcat_encode_chunks(noisy.data, noisy.length, 65536, NULL, &out, &offsets);
+    }
+    out.length = 0;
+    start = start_counting(true);
+    status = lzfse_zazzcat_encode_chunks(noisy.data, noisy.length, 65536, NULL, &out, &offsets);
+    chunks = stop_counting(start);
+    CHECK(status == LZFSE_ZAZZCAT_OK && offsets.length == 65, "64 noisy chunks");
+    CHECK(chunks.calls == 0, "warmed-up noisy chunked encoding made %zu allocations", chunks.calls);
+    lzfse_zazzcat_buffer_free(&noisy);
     lzfse_zazzcat_buffer_free(&out);
     lzfse_zazzcat_offsets_free(&offsets);
 }

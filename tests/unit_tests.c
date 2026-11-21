@@ -966,6 +966,41 @@ static void test_chunks_round_trip_in_order(void) {
     raw_free(data);
 }
 
+// Chunked output and offsets are identical to encoding every chunk alone, for incompressible input (so the encoded
+// total is about the input size) at sizes around the point where the pool starts copying in parallel (512 KiB),
+// around chunk and task boundaries, and after a prefix already in the output.
+static void test_chunks_gather_matches_serial(void) {
+    static const size_t sizes[] = {1,      4095,         4096,          4097,   300000,  524288 - 4096, 524288 - 100,
+                                   524288, 524288 + 100, 524288 + 4096, 700000, 2000000, 3 << 20};
+    static const size_t chunk_sizes[] = {4096, 65536, 100000};
+    for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+        size_t n = sizes[si];
+        lzfse_zazzcat_buffer data = noise(n, (uint32_t)(si + 1));
+        for (size_t ci = 0; ci < sizeof chunk_sizes / sizeof chunk_sizes[0]; ci++) {
+            size_t chunk = chunk_sizes[ci];
+            lzfse_zazzcat_buffer out = copy_of("prefix", 6), expected = copy_of("prefix", 6);
+            lzfse_zazzcat_offsets offsets = {0};
+            REQUIRE(lzfse_zazzcat_encode_chunks(data.data, n, chunk, NULL, &out, &offsets) == LZFSE_ZAZZCAT_OK,
+                    "encode");
+            size_t chunks = (n + chunk - 1) / chunk;
+            CHECK(offsets.length == chunks + 1 && offsets.data[0] == 6, "offsets for n=%zu chunk=%zu", n, chunk);
+            bool offsets_match = offsets.length == chunks + 1;
+            for (size_t i = 0; i < chunks && offsets_match; i++) {
+                lzfse_zazzcat_buffer alone = encode_buffer(data.data + i * chunk, min_size(chunk, n - i * chunk));
+                bare_buffer_append(&expected, alone.data, alone.length);
+                offsets_match = offsets.data[i + 1] == expected.length;
+                lzfse_zazzcat_buffer_free(&alone);
+            }
+            CHECK(offsets_match, "offsets n=%zu chunk=%zu", n, chunk);
+            CHECK(same_bytes(out.data, out.length, expected.data, expected.length), "bytes n=%zu chunk=%zu", n, chunk);
+            lzfse_zazzcat_buffer_free(&out);
+            lzfse_zazzcat_buffer_free(&expected);
+            lzfse_zazzcat_offsets_free(&offsets);
+        }
+        lzfse_zazzcat_buffer_free(&data);
+    }
+}
+
 // --- decmpfs and statistics ---
 
 static void test_decmpfs_layouts_round_trip(void) {
@@ -1111,6 +1146,7 @@ int main(void) {
     RUN_TEST(test_small_path_boundaries);
     RUN_TEST(test_reused_encoder_matches_fresh);
     RUN_TEST(test_chunks_round_trip_in_order);
+    RUN_TEST(test_chunks_gather_matches_serial);
     RUN_TEST(test_decmpfs_layouts_round_trip);
     RUN_TEST(test_status_strings_are_distinct);
 #ifndef __APPLE__
