@@ -170,10 +170,31 @@ static void test_chunked_encoding(void) {
     lzfse_zazzcat_offsets_free(&offsets);
 }
 
+// A one-chunk call runs on the caller with thread-local state, and allocates nothing once warmed up.
+static void test_small_chunked_encoding(void) {
+    lzfse_zazzcat_buffer small = text(30000), out = {0};
+    lzfse_zazzcat_offsets offsets = {0};
+    for (int i = 0; i < 3; i++) {
+        out.length = 0;
+        bare_lzfse_zazzcat_encode_chunks(small.data, small.length, 65536, NULL, &out, &offsets);
+    }
+    out.length = 0;
+    allocation_count start = start_counting(false);
+    lzfse_zazzcat_status status = lzfse_zazzcat_encode_chunks(small.data, small.length, 65536, NULL, &out, &offsets);
+    allocation_count chunks = stop_counting(start);
+    bare_printf("    encode_chunks, one chunk, warmed up: (%zu, %zu)\n", chunks.calls, chunks.bytes);
+    CHECK(status == LZFSE_ZAZZCAT_OK && offsets.length == 2, "1 chunk");
+    CHECK(chunks.calls == 0, "warmed-up one-chunk encoding made %zu allocations", chunks.calls);
+    lzfse_zazzcat_buffer_free(&small);
+    lzfse_zazzcat_buffer_free(&out);
+    lzfse_zazzcat_offsets_free(&offsets);
+}
+
 int main(void) {
     RUN_TEST(test_reuse_is_allocation_free);
     RUN_TEST(test_one_shot_allocations_are_bounded);
     RUN_TEST(test_chunked_encoding);
+    RUN_TEST(test_small_chunked_encoding);
     if (test_failures) {
         bare_printf("%d check(s) failed\n", test_failures);
         return 1;

@@ -129,6 +129,10 @@ static bool scratch_reserve(task_scratch *scratch, const chunk_layout *layout) {
 static lzfse_zazzcat_encoder *serial_encoder;
 static task_scratch serial_scratch;
 
+size_t parallel_busy_fallbacks(void) {
+    return 0;
+}
+
 size_t lzfse_zazzcat_parallelism(void) {
     return 1;
 }
@@ -199,8 +203,14 @@ typedef struct worker_pool {
     size_t thread_count;
     // One encoder per thread, created on first use and kept.
     lzfse_zazzcat_encoder **encoders;
-    // Serializes calls: one job runs at a time.
+    // Serializes pooled calls: one job runs on the workers at a time. A call that finds it taken runs on its own
+    // thread instead of waiting (see `local_state`).
     pthread_mutex_t call_mutex;
+    // Key whose destructor frees a thread's `local_state` when the thread exits.
+    pthread_key_t local_key;
+    bool local_key_ready;
+    // How many calls found the pool busy and ran on the caller (counted for the tests).
+    atomic_size_t busy_fallbacks;
     // Guards `generation`; workers sleep on `job_ready` and the caller on `job_finished`.
     pthread_mutex_t mutex;
     pthread_cond_t job_ready;
@@ -215,6 +225,60 @@ typedef struct worker_pool {
 
 static worker_pool pool;
 static pthread_once_t pool_once = PTHREAD_ONCE_INIT;
+
+// A calling thread's own encoder and scratch arrays, for jobs that run on the caller alone (a single task, or the
+// pool busy with another call). Kept between calls; freed when the thread exits.
+typedef struct local_state {
+    lzfse_zazzcat_encoder *encoder;
+    task_scratch scratch;
+} local_state;
+
+// This thread's state, allocated on first use. (It is heap memory, not the thread-local variable itself, because
+// the destructor can run after the thread's local variables are gone.)
+static _Thread_local local_state *local;
+
+// Free a thread's local state (the destructor of `pool.local_key`; `state` is that thread's `local`). It clears
+// `local` in case thread-exit code later in the same thread encodes again.
+static void local_release(void *state) {
+    local_state *s = state;
+    lzfse_zazzcat_encoder_destroy(s->encoder);
+    for (size_t i = 0; i < s->scratch.task_buffer_capacity; i++) lzfse_zazzcat_buffer_free(&s->scratch.task_buffers[i]);
+    zz_free(s->scratch.task_buffers);
+    zz_free(s->scratch.ends);
+    zz_free(s);
+    local = NULL;
+}
+
+// This thread's local state, registered for cleanup at thread exit; NULL if it cannot be registered.
+static local_state *local_acquire(void) {
+    if (local != NULL) return local;
+    local_state *created = zz_calloc(1, sizeof *created);
+    if (created == NULL) return NULL;
+    if (pthread_setspecific(pool.local_key, created) != 0) {
+        zz_free(created);
+        return NULL;
+    }
+    local = created;
+    return created;
+}
+
+// Encode the whole input as one task on the calling thread, with its local encoder and scratch arrays.
+static lzfse_zazzcat_status encode_on_caller(const chunk_layout *pooled, const lzfse_zazzcat_options *options,
+                                             lzfse_zazzcat_buffer *output, lzfse_zazzcat_offsets *offsets) {
+    local_state *s = local_acquire();
+    if (s == NULL) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    chunk_layout layout = *pooled;
+    layout.chunks_per_task = layout.chunk_count;
+    layout.task_count = 1;
+    if (s->encoder == NULL && (s->encoder = lzfse_zazzcat_encoder_create(options)) == NULL) {
+        return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    }
+    lzfse_zazzcat_encoder_set_options(s->encoder, options);
+    if (!scratch_reserve(&s->scratch, &layout)) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    lzfse_zazzcat_status status = encode_task(s->encoder, &layout, 0, &s->scratch);
+    if (status != LZFSE_ZAZZCAT_OK) return status;
+    return gather(&layout, &s->scratch, output, offsets);
+}
 
 // Claim and run tasks of the job with generation `generation` with thread `thread_index`'s encoder until none are
 // left or the slot has moved on to another job.
@@ -276,6 +340,7 @@ static void pool_start(void) {
     size_t wanted = cpus > 0 ? (size_t)cpus : 1;
     if (wanted > MAX_POOL_THREADS) wanted = MAX_POOL_THREADS;
     bare_pthread_mutex_init(&pool.call_mutex, NULL);
+    pool.local_key_ready = pthread_key_create(&pool.local_key, local_release) == 0;
     bare_pthread_mutex_init(&pool.mutex, NULL);
     bare_pthread_cond_init(&pool.job_ready, NULL);
     bare_pthread_cond_init(&pool.job_finished, NULL);
@@ -288,6 +353,10 @@ static void pool_start(void) {
         bare_pthread_detach(thread);
         pool.thread_count++;
     }
+}
+
+size_t parallel_busy_fallbacks(void) {
+    return atomic_load(&pool.busy_fallbacks);
 }
 
 size_t lzfse_zazzcat_parallelism(void) {
@@ -320,7 +389,7 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
         return LZFSE_ZAZZCAT_OK;
     }
     size_t threads = lzfse_zazzcat_parallelism();
-    if (pool.encoders == NULL) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
+    if (pool.encoders == NULL || !pool.local_key_ready) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
     size_t chunks_per_task = div_ceil(chunk_count, threads * TASKS_PER_THREAD);
     chunk_layout layout = {
         .source = source,
@@ -331,7 +400,15 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
         .task_count = div_ceil(chunk_count, chunks_per_task),
     };
 
-    bare_pthread_mutex_lock(&pool.call_mutex);
+    lzfse_zazzcat_options job_options = options != NULL ? *options : lzfse_zazzcat_default_options();
+    // A call with one task has nothing for the workers to share, so it never touches the pool (its job slot,
+    // scratch or mutex). If the pool is busy with another call, this one runs on the caller instead of waiting.
+    if (pool.thread_count == 1 || layout.task_count == 1)
+        return encode_on_caller(&layout, &job_options, output, offsets);
+    if (pthread_mutex_trylock(&pool.call_mutex) != 0) {
+        atomic_fetch_add(&pool.busy_fallbacks, 1);
+        return encode_on_caller(&layout, &job_options, output, offsets);
+    }
     if (!scratch_reserve(&pool.scratch, &layout)) {
         bare_pthread_mutex_unlock(&pool.call_mutex);
         return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
@@ -339,7 +416,7 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
     // Every worker of the previous job has stopped touching the slot (its tasks all finished), so fill it in.
     job *j = &pool.slot;
     j->layout = layout;
-    j->options = options != NULL ? *options : lzfse_zazzcat_default_options();
+    j->options = job_options;
     j->scratch = &pool.scratch;
     atomic_store_explicit(&j->finished_tasks, 0, memory_order_relaxed);
     atomic_store_explicit(&j->status, LZFSE_ZAZZCAT_OK, memory_order_relaxed);

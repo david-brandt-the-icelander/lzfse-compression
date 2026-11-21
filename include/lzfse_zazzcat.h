@@ -144,7 +144,9 @@ size_t lzfse_zazzcat_parallelism(void);
 // Compress `source` in independent `chunk_size`-byte pieces on all cores, appending the streams back to back to
 // `output`. `offsets` is cleared and filled with n + 1 positions in `output`: stream i occupies
 // output->data[offsets->data[i] .. offsets->data[i + 1]). This is the layout of an APFS resource fork. Once
-// `output`, `offsets` and the worker threads have warmed up, repeated calls allocate nothing.
+// `output`, `offsets` and the worker threads have warmed up, repeated calls allocate nothing. Safe to call from
+// several threads at once: one call at a time uses the worker threads; a call with a single chunk, and a call that
+// finds the workers busy, runs on its own thread with that thread's own encoder (freed when the thread exits).
 lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t source_length, size_t chunk_size,
                                                  const lzfse_zazzcat_options *options, lzfse_zazzcat_buffer *output,
                                                  lzfse_zazzcat_offsets *offsets);

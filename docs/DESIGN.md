@@ -296,6 +296,9 @@ At 64 KiB chunks on real files it encodes 30–45% faster than the general finde
     calls.
   - **`lzfse_zazzcat_encode_chunks`:** writes the streams back to back plus an offset table, which is the resource-fork
     layout. Once warmed up, it allocates nothing (`tests/alloc_tests.c`).
+  - **Concurrent callers:** one call at a time uses the pool (`pthread_mutex_trylock`). A call with a single task, or
+    one that finds the pool busy, runs on its own thread with a thread-local encoder and scratch arrays (freed by a
+    `pthread_key` destructor at thread exit), so small-file callers on different threads never wait for each other.
   - **Without pthreads:** `-DLZFSE_ZAZZCAT_NO_THREADS` builds a serial version of the same API.
 - **One-shot functions:** `lzfse_zazzcat_encode` and `lzfse_zazzcat_decode` keep no global state. Long-lived callers
   reuse an encoder or decoder object, which allocates nothing per call.
