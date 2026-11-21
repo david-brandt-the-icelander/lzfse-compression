@@ -8,8 +8,8 @@ speed, four proposed fixes, one pull request per fix, and a benchmark of each. *
 a small win, and two measured as nothing.** It is written as source material for the series' main articles. The
 last section lists the posts it could become and the facts each one needs.
 
-At the time of writing all four pull requests are open and none is merged. Nothing in `src/` changed as part of
-this post; the only file it adds is this one.
+Outcome: #38 and #40 were merged, and #39 and #41 were closed without merging (see Part 5). This post itself
+changes nothing in `src/`; it only adds this file.
 
 ## The one-paragraph version
 
@@ -56,7 +56,8 @@ commit `c7970d9`), so it is not one of the findings.
 
 Each pull request was written by its own fresh Claude Code session with only that finding's brief, so the four
 could be reviewed and measured separately. All four changed only `src/parallel.c` (plus tests, and docs for #40
-and #41). They conflict with each other textually, so expect to merge them one at a time.
+and #41). They conflict with each other textually, so they could only be merged one at a time; in practice #40 had
+to be reworked after #38 landed (Part 5).
 
 The sessions were told not to run benchmarks, because four sessions building at once would make timings noisy.
 Measurement happened afterwards, here.
@@ -148,13 +149,40 @@ is untested: a caller that hands in a fresh, cold output buffer on every call mi
   about 20% for the serial copy) did not appear. This is the same lesson as in the earlier posts: a change lands
   only with a measurement.
 
-## Part 5: what this does and does not show
+## Part 5: what was merged
+
+The owner's decision after the measurements: merge the two that measured as wins, close the two that did not.
+
+| PR | Finding | Outcome |
+|---|---|---|
+| [#38](https://github.com/david-brandt-the-icelander/lzfse-compression/pull/38) | 1: join on task count | Merged. A small speed gain, a tighter p90, and no all-workers wait |
+| [#40](https://github.com/david-brandt-the-icelander/lzfse-compression/pull/40) | 2: lock-free single-task path | Merged after a conflict fix (below) |
+| [#39](https://github.com/david-brandt-the-icelander/lzfse-compression/pull/39) | 4: relaxed atomics and padding | Closed: no measurable change, so not worth the churn |
+| [#41](https://github.com/david-brandt-the-icelander/lzfse-compression/pull/41) | 3: parallel `gather` | Closed: no gain, and it adds a second pool phase |
+
+Both merged pull requests rewrote the wake/join part of `src/parallel.c`, so #40 conflicted as soon as #38 landed.
+The session that wrote #40 merged `main` into its branch and resolved the conflict. The rule it had to keep is
+that a call with one task never touches the pool's job slot, its scratch arrays or `call_mutex`, and that a busy
+pool sends a call to the caller's own thread-local encoder and scratch instead of making it wait. The merge was
+checked by rebuilding the pull request's head in a clean worktree, running `make all test test-alloc`, and
+repeating the concurrent benchmark: eight callers on 16 KiB buffers gave about 275k to 280k calls per second,
+the same as before the merge, and a 1 MiB single-caller call still took about 335 us.
+
+Two things to know about the merged code:
+
+- Each calling thread now keeps its own encoder and scratch, freed by a `pthread_key` destructor when the thread
+  exits. That is memory per calling thread. A large call that finds the pool busy also encodes the whole input on
+  the caller with that thread-local scratch, so the scratch can grow to the size of the largest such call.
+- The CI `lint` job has failed on `main` since pull request #36, before any of these changes, so it was not
+  caused by them and was not fixed here.
+
+## Part 6: what this does and does not show
 
 - It shows that the global lock is the one piece of thread-safety that costs real throughput, and only when
   callers are concurrent.
 - It does not show that the pool is optimal. It says nothing about the E-cores' effect on tail time, or about the
-  case where several large concurrent calls compete for the same cores (PR #40 runs those serially on the caller
-  when the pool is busy; that case was not measured).
+  case where several large concurrent calls compete for the same cores (the merged #40 runs those serially on the
+  caller when the pool is busy; that case was not measured).
 - The results come from one machine with background load, synthetic data and a hand-written harness. A rerun of
   the PR #38 and #40 comparisons on an idle machine with `lzfse-bench`'s corpus would make a stronger record.
   The numbers in the pull-request comments are the same as the ones here.
@@ -171,5 +199,7 @@ Posts this source material could support, and the facts each needs:
    hides the wake-up.
 3. **"Guessing 20% and finding 0%."** Facts: the `gather` estimate, the table for PR #41, the buffer-reuse caveat,
    and the earlier "measured and reverted" posts as a pattern.
-4. **"Benchmarking the wrong commit."** Facts: the renamed branches, the CPU-use tell, the habit of reading the
+4. **"Two PRs, one function: merging rewrites of the same code."** Facts: both merged pull requests rewrote the
+   wake/join code, the conflict, the invariant the resolver had to keep, and the re-measurement after the merge.
+5. **"Benchmarking the wrong commit."** Facts: the renamed branches, the CPU-use tell, the habit of reading the
    head commit from the pull request. A short post, useful as a method note.
