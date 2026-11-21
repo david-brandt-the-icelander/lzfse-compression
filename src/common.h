@@ -119,6 +119,10 @@ ALWAYS_INLINE void store_u64_x3(uint8_t *at, uint64_t first, uint64_t second, ui
     copy_bytes(at, values, sizeof values);
 }
 
+// How many chunked-encoding calls found the worker pool busy and ran on their own thread (0 without threads).
+// Exists so the tests can check that fallback.
+size_t parallel_busy_fallbacks(void);
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "lzfse-zazzcat assumes a little-endian CPU (Apple Silicon, x86-64, other little-endian ARM)"
 #endif

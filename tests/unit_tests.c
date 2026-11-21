@@ -2,6 +2,8 @@
 // paths, parallel chunks, decmpfs, statistics, round trips and hostile input. On macOS this also runs the Apple
 // interoperability tests (apple_tests.c, included below).
 #define _DARWIN_C_SOURCE // macOS: chflags, st_flags and extended attributes, used by the Apple tests
+#include <stdatomic.h>
+
 #include "bare_functions.h"
 #include "bits.h"
 #include "copy.h"
@@ -966,6 +968,85 @@ static void test_chunks_round_trip_in_order(void) {
     raw_free(data);
 }
 
+#ifndef LZFSE_ZAZZCAT_NO_THREADS
+// Inputs for the concurrent-callers test: one chunk, a few chunks, and many chunks.
+#define CONCURRENT_INPUTS  3
+#define CONCURRENT_THREADS 4
+
+typedef struct concurrent_job {
+    const uint8_t *inputs[CONCURRENT_INPUTS];
+    size_t lengths[CONCURRENT_INPUTS];
+    size_t chunk_sizes[CONCURRENT_INPUTS];
+    lzfse_zazzcat_buffer expected[CONCURRENT_INPUTS];
+    lzfse_zazzcat_offsets expected_offsets[CONCURRENT_INPUTS];
+    size_t rounds;
+    atomic_int mismatches;
+} concurrent_job;
+
+// One caller thread: encode every input `rounds` times and count results that differ from the serial ones.
+static void *concurrent_caller(void *argument) {
+    concurrent_job *job = argument;
+    lzfse_zazzcat_buffer out = {0};
+    lzfse_zazzcat_offsets offsets = {0};
+    for (size_t r = 0; r < job->rounds; r++) {
+        for (int i = 0; i < CONCURRENT_INPUTS; i++) {
+            out.length = 0;
+            lzfse_zazzcat_status status =
+                lzfse_zazzcat_encode_chunks(job->inputs[i], job->lengths[i], job->chunk_sizes[i], NULL, &out, &offsets);
+            bool same = status == LZFSE_ZAZZCAT_OK && offsets.length == job->expected_offsets[i].length &&
+                        equal_bytes(offsets.data, job->expected_offsets[i].data, offsets.length * sizeof(size_t)) &&
+                        same_bytes(out.data, out.length, job->expected[i].data, job->expected[i].length);
+            if (!same) atomic_fetch_add(&job->mismatches, 1);
+        }
+    }
+    lzfse_zazzcat_buffer_free(&out);
+    lzfse_zazzcat_offsets_free(&offsets);
+    return NULL;
+}
+
+// Run `CONCURRENT_THREADS` callers on `job`.
+static void run_concurrent_callers(concurrent_job *job) {
+    pthread_t threads[CONCURRENT_THREADS];
+    for (int t = 0; t < CONCURRENT_THREADS; t++) bare_pthread_create(&threads[t], NULL, concurrent_caller, job);
+    for (int t = 0; t < CONCURRENT_THREADS; t++) bare_pthread_join(threads[t], NULL);
+}
+
+// Callers on several threads, with small and large inputs, get exactly the serial result, including when the
+// pool is busy and a call falls back to its own thread.
+static void test_concurrent_chunk_callers_match_serial(void) {
+    static const size_t lengths[CONCURRENT_INPUTS] = {5000, 40000, 1500000};
+    static const size_t chunk_sizes[CONCURRENT_INPUTS] = {65536, 65536, 4096};
+    concurrent_job job = {.rounds = 3};
+    atomic_init(&job.mismatches, 0);
+    for (int i = 0; i < CONCURRENT_INPUTS; i++) {
+        uint8_t *data = raw_malloc(lengths[i]);
+        for (uint32_t k = 0; k < lengths[i]; k++) data[k] = (uint8_t)(((k / (3 + i)) % 251) ^ (k % 7));
+        job.inputs[i] = data;
+        job.lengths[i] = lengths[i];
+        job.chunk_sizes[i] = chunk_sizes[i];
+        REQUIRE(lzfse_zazzcat_encode_chunks(data, lengths[i], chunk_sizes[i], NULL, &job.expected[i],
+                                            &job.expected_offsets[i]) == LZFSE_ZAZZCAT_OK,
+                "serial reference");
+    }
+    run_concurrent_callers(&job);
+    // Keep going until a call has found the pool busy (the callers race, so allow a number of attempts).
+    size_t before = parallel_busy_fallbacks();
+    job.rounds = 5;
+    for (int attempt = 0; attempt < 200 && lzfse_zazzcat_parallelism() > 1 && parallel_busy_fallbacks() == before;
+         attempt++) {
+        run_concurrent_callers(&job);
+    }
+    CHECK(atomic_load(&job.mismatches) == 0, "%d concurrent results differed from the serial ones",
+          atomic_load(&job.mismatches));
+    CHECK(lzfse_zazzcat_parallelism() == 1 || parallel_busy_fallbacks() > before, "no call found the pool busy");
+    for (int i = 0; i < CONCURRENT_INPUTS; i++) {
+        raw_free((void *)job.inputs[i]);
+        lzfse_zazzcat_buffer_free(&job.expected[i]);
+        lzfse_zazzcat_offsets_free(&job.expected_offsets[i]);
+    }
+}
+#endif
+
 // --- decmpfs and statistics ---
 
 static void test_decmpfs_layouts_round_trip(void) {
@@ -1111,6 +1192,9 @@ int main(void) {
     RUN_TEST(test_small_path_boundaries);
     RUN_TEST(test_reused_encoder_matches_fresh);
     RUN_TEST(test_chunks_round_trip_in_order);
+#ifndef LZFSE_ZAZZCAT_NO_THREADS
+    RUN_TEST(test_concurrent_chunk_callers_match_serial);
+#endif
     RUN_TEST(test_decmpfs_layouts_round_trip);
     RUN_TEST(test_status_strings_are_distinct);
 #ifndef __APPLE__
