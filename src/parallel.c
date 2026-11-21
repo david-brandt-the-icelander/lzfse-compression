@@ -171,14 +171,30 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
 #include <stdatomic.h>
 #include <unistd.h>
 
-// One call's work, shared by all threads while it runs.
+// The pool never has more threads than this, so a job's task count (at most TASKS_PER_THREAD per thread) fits the
+// 16 bits it gets in a claim word.
+#define MAX_POOL_THREADS 4096
+
+// Pack a job's claim word: the job's generation (low 32 bits), its task count and the next task to hand out.
+static uint64_t claim_make(uint64_t generation, size_t task_count, size_t next_task) {
+    return (generation & 0xFFFFFFFFu) << 32 | (uint64_t)task_count << 16 | (uint64_t)next_task;
+}
+
+// The pool's single job slot. It belongs to the pool, not to a caller's stack, so a worker that wakes late only
+// ever reads the claim word (which says whether its job is still current) and never stale job data.
 typedef struct job {
+    // Written by the caller before it publishes the job through `claim`; read by threads that claimed a task.
     chunk_layout layout;
     lzfse_zazzcat_options options;
     // The pool's scratch arrays; each task writes only its own buffer and its own chunks' ends.
     task_scratch *scratch;
-    // Next task index to claim (threads take tasks until they run out), and the first error.
-    atomic_size_t next_task;
+    // These change while the job runs; keep them on their own cache lines, away from the read-only fields above.
+    // Generation, task count and next task to hand out (see claim_make). A task is claimed by a compare-exchange
+    // that succeeds only while the generation matches and tasks remain.
+    _Alignas(128) atomic_uint_fast64_t claim;
+    // Tasks finished so far (a release increment; the caller's acquire load makes their output visible), and the
+    // first error.
+    _Alignas(128) atomic_size_t finished_tasks;
     atomic_int status;
 } job;
 
@@ -195,15 +211,14 @@ typedef struct worker_pool {
     bool local_key_ready;
     // How many calls found the pool busy and ran on the caller (counted for the tests).
     atomic_size_t busy_fallbacks;
-    // Guards the fields below; workers sleep on `job_ready` and the caller on `job_finished`.
+    // Guards `generation`; workers sleep on `job_ready` and the caller on `job_finished`.
     pthread_mutex_t mutex;
     pthread_cond_t job_ready;
     pthread_cond_t job_finished;
-    job *current_job;
-    // Incremented for every job, so a worker can tell a new job from one it has already done.
+    // Incremented for every job, so a worker can tell a new job from one it has already seen.
     uint64_t generation;
-    // Workers that have finished the current job.
-    size_t finished_workers;
+    // The job slot (guarded by call_mutex for writing).
+    job slot;
     // Task buffers and chunk ends, kept between calls (guarded by call_mutex).
     task_scratch scratch;
 } worker_pool;
@@ -265,12 +280,21 @@ static lzfse_zazzcat_status encode_on_caller(const chunk_layout *pooled, const l
     return gather(&layout, &s->scratch, output, offsets);
 }
 
-// Claim and run tasks of `j` with thread `thread_index`'s encoder until none are left.
-static void run_tasks(job *j, size_t thread_index) {
+// Claim and run tasks of the job with generation `generation` with thread `thread_index`'s encoder until none are
+// left or the slot has moved on to another job.
+static void run_tasks(uint64_t generation, size_t thread_index) {
+    job *j = &pool.slot;
     lzfse_zazzcat_encoder **encoder = &pool.encoders[thread_index];
+    uint64_t seen = atomic_load_explicit(&j->claim, memory_order_acquire);
     for (;;) {
-        size_t task = atomic_fetch_add(&j->next_task, 1);
-        if (task >= j->layout.task_count) return;
+        size_t task_count = (size_t)(seen >> 16 & 0xFFFF), task = (size_t)(seen & 0xFFFF);
+        if ((seen >> 32) != (generation & 0xFFFFFFFFu) || task >= task_count) return;
+        // The acquire on success pairs with the caller's release store of the claim word, so the job's fields are
+        // visible; on failure `seen` is reloaded.
+        if (!atomic_compare_exchange_weak_explicit(&j->claim, &seen, seen + 1, memory_order_acquire,
+                                                   memory_order_acquire)) {
+            continue;
+        }
         lzfse_zazzcat_status status = LZFSE_ZAZZCAT_OK;
         if (*encoder == NULL) *encoder = lzfse_zazzcat_encoder_create(&j->options);
         if (*encoder == NULL) {
@@ -281,12 +305,21 @@ static void run_tasks(job *j, size_t thread_index) {
         }
         if (status != LZFSE_ZAZZCAT_OK) {
             int ok = LZFSE_ZAZZCAT_OK;
-            atomic_compare_exchange_strong(&j->status, &ok, (int)status);
+            atomic_compare_exchange_strong_explicit(&j->status, &ok, (int)status, memory_order_relaxed,
+                                                    memory_order_relaxed);
         }
+        // Done with this job's data; whoever finishes the last task wakes the caller if it is asleep. Taking the
+        // mutex first means the caller is either not yet waiting (and will see the count) or already waiting.
+        if (atomic_fetch_add_explicit(&j->finished_tasks, 1, memory_order_release) + 1 == task_count) {
+            bare_pthread_mutex_lock(&pool.mutex);
+            bare_pthread_cond_signal(&pool.job_finished);
+            bare_pthread_mutex_unlock(&pool.mutex);
+        }
+        seen = atomic_load_explicit(&j->claim, memory_order_acquire);
     }
 }
 
-// A worker thread: wait for each new job, help with its tasks, report that it is done.
+// A worker thread: wait for each new job, help with its tasks, go back to sleep.
 static void *worker_main(void *argument) {
     size_t thread_index = (size_t)(uintptr_t)argument;
     uint64_t seen_generation = 0;
@@ -294,12 +327,8 @@ static void *worker_main(void *argument) {
         bare_pthread_mutex_lock(&pool.mutex);
         while (pool.generation == seen_generation) bare_pthread_cond_wait(&pool.job_ready, &pool.mutex);
         seen_generation = pool.generation;
-        job *j = pool.current_job;
         bare_pthread_mutex_unlock(&pool.mutex);
-        run_tasks(j, thread_index);
-        bare_pthread_mutex_lock(&pool.mutex);
-        if (++pool.finished_workers == pool.thread_count - 1) bare_pthread_cond_signal(&pool.job_finished);
-        bare_pthread_mutex_unlock(&pool.mutex);
+        run_tasks(seen_generation, thread_index);
     }
     return NULL;
 }
@@ -309,6 +338,7 @@ static void *worker_main(void *argument) {
 static void pool_start(void) {
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
     size_t wanted = cpus > 0 ? (size_t)cpus : 1;
+    if (wanted > MAX_POOL_THREADS) wanted = MAX_POOL_THREADS;
     bare_pthread_mutex_init(&pool.call_mutex, NULL);
     pool.local_key_ready = pthread_key_create(&pool.local_key, local_release) == 0;
     bare_pthread_mutex_init(&pool.mutex, NULL);
@@ -334,6 +364,19 @@ size_t lzfse_zazzcat_parallelism(void) {
     return pool.thread_count;
 }
 
+// Wait until all `task_count` tasks of the current job have finished: spin briefly (small jobs end within
+// microseconds), then sleep on the condition variable.
+static void wait_for_tasks(job *j, size_t task_count) {
+    for (int spin = 0; spin < 2000; spin++) {
+        if (atomic_load_explicit(&j->finished_tasks, memory_order_acquire) == task_count) return;
+    }
+    bare_pthread_mutex_lock(&pool.mutex);
+    while (atomic_load_explicit(&j->finished_tasks, memory_order_acquire) != task_count) {
+        bare_pthread_cond_wait(&pool.job_finished, &pool.mutex);
+    }
+    bare_pthread_mutex_unlock(&pool.mutex);
+}
+
 lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t length, size_t chunk_size,
                                                  const lzfse_zazzcat_options *options, lzfse_zazzcat_buffer *output,
                                                  lzfse_zazzcat_offsets *offsets) {
@@ -348,49 +391,50 @@ lzfse_zazzcat_status lzfse_zazzcat_encode_chunks(const void *source, size_t leng
     size_t threads = lzfse_zazzcat_parallelism();
     if (pool.encoders == NULL || !pool.local_key_ready) return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
     size_t chunks_per_task = div_ceil(chunk_count, threads * TASKS_PER_THREAD);
-    job j = {
-        .layout =
-            {
-                .source = source,
-                .length = length,
-                .chunk_size = chunk_size,
-                .chunk_count = chunk_count,
-                .chunks_per_task = chunks_per_task,
-                .task_count = div_ceil(chunk_count, chunks_per_task),
-            },
-        .options = options != NULL ? *options : lzfse_zazzcat_default_options(),
-        .scratch = &pool.scratch,
+    chunk_layout layout = {
+        .source = source,
+        .length = length,
+        .chunk_size = chunk_size,
+        .chunk_count = chunk_count,
+        .chunks_per_task = chunks_per_task,
+        .task_count = div_ceil(chunk_count, chunks_per_task),
     };
-    atomic_init(&j.next_task, 0);
-    atomic_init(&j.status, LZFSE_ZAZZCAT_OK);
 
-    // A call with one task has nothing for the workers to share, so it never touches the pool. If the pool is
-    // busy with another call, this one runs on the caller instead of waiting for it.
-    if (pool.thread_count == 1 || j.layout.task_count == 1)
-        return encode_on_caller(&j.layout, &j.options, output, offsets);
+    lzfse_zazzcat_options job_options = options != NULL ? *options : lzfse_zazzcat_default_options();
+    // A call with one task has nothing for the workers to share, so it never touches the pool (its job slot,
+    // scratch or mutex). If the pool is busy with another call, this one runs on the caller instead of waiting.
+    if (pool.thread_count == 1 || layout.task_count == 1)
+        return encode_on_caller(&layout, &job_options, output, offsets);
     if (pthread_mutex_trylock(&pool.call_mutex) != 0) {
         atomic_fetch_add(&pool.busy_fallbacks, 1);
-        return encode_on_caller(&j.layout, &j.options, output, offsets);
+        return encode_on_caller(&layout, &job_options, output, offsets);
     }
-    if (!scratch_reserve(&pool.scratch, &j.layout)) {
+    if (!scratch_reserve(&pool.scratch, &layout)) {
         bare_pthread_mutex_unlock(&pool.call_mutex);
         return LZFSE_ZAZZCAT_OUT_OF_MEMORY;
     }
-    pthread_mutex_lock(&pool.mutex);
-    pool.current_job = &j;
-    pool.finished_workers = 0;
-    pool.generation++;
-    pthread_cond_broadcast(&pool.job_ready);
-    pthread_mutex_unlock(&pool.mutex);
-    run_tasks(&j, 0);
-    // Wait until every worker has stopped touching the job (it lives on this function's stack).
-    pthread_mutex_lock(&pool.mutex);
-    while (pool.finished_workers < pool.thread_count - 1) pthread_cond_wait(&pool.job_finished, &pool.mutex);
-    pool.current_job = NULL;
+    // Every worker of the previous job has stopped touching the slot (its tasks all finished), so fill it in.
+    job *j = &pool.slot;
+    j->layout = layout;
+    j->options = job_options;
+    j->scratch = &pool.scratch;
+    atomic_store_explicit(&j->finished_tasks, 0, memory_order_relaxed);
+    atomic_store_explicit(&j->status, LZFSE_ZAZZCAT_OK, memory_order_relaxed);
+    // Wake only as many workers as there are tasks beyond the caller's own, and only when there are any.
+    size_t wake = min_size(pool.thread_count - 1, layout.task_count - 1);
+    bare_pthread_mutex_lock(&pool.mutex);
+    uint64_t generation = ++pool.generation;
+    // Publish the job: the release store makes the fields above visible to whoever claims a task.
+    atomic_store_explicit(&j->claim, claim_make(generation, layout.task_count, 0), memory_order_release);
     bare_pthread_mutex_unlock(&pool.mutex);
-    lzfse_zazzcat_status status = (lzfse_zazzcat_status)atomic_load(&j.status);
+    // A signal that finds no sleeping worker is not lost: a worker that is awake checks the generation before it
+    // sleeps again.
+    for (size_t i = 0; i < wake; i++) bare_pthread_cond_signal(&pool.job_ready);
+    run_tasks(generation, 0);
+    wait_for_tasks(j, layout.task_count);
+    lzfse_zazzcat_status status = (lzfse_zazzcat_status)atomic_load_explicit(&j->status, memory_order_relaxed);
     if (status == LZFSE_ZAZZCAT_OK) {
-        status = gather(&j.layout, &pool.scratch, output, offsets);
+        status = gather(&layout, &pool.scratch, output, offsets);
     }
     bare_pthread_mutex_unlock(&pool.call_mutex);
     return status;
