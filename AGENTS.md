@@ -17,7 +17,8 @@ Target: Apple Silicon (M1 and later) on macOS. Linux builds and tests only so th
 
 ## Commands
 - Build: `make` (library `build/liblzfse_zazzcat.a`, CLI `build/lzfse-zazzcat`, benchmark `build/lzfse-bench`).
-- Before committing: `make format && make all test test-alloc test-sanitize` (on macOS `make test` also runs the libcompression and kernel tests).
+- Branch coverage (clang): `LLVM_BIN=<dir of clang and llvm-cov> scripts/branch_coverage.sh` (about 97%; what is left cannot be reached without changing the library: checks that an earlier check makes redundant, system calls that do not fail, a one-CPU machine).
+- Before committing: `make format && make all test test-alloc test-sanitize` (on macOS `make test` also runs the libcompression and kernel tests; `make test-alloc` also runs the out-of-memory tests, which fail each allocation in turn).
 - No-threads build: `make DEFINES=-DLZFSE_ZAZZCAT_NO_THREADS`.
 - CLI: `build/lzfse-zazzcat encode|decode <in> <out>`, `build/lzfse-zazzcat inspect <in>`.
 - Benchmarks: `build/lzfse-bench --help` (compares against `libcompression` on macOS; `--stats` compares the encoders' choices). Tune with `make CPU_FLAGS=-mcpu=apple-m1`.
